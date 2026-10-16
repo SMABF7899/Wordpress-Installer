@@ -1,0 +1,1546 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+wp_installer.py
+===============
+Download and prepare the Persian WordPress (fa_IR) on Windows and Linux
+(Python standard library only, except the database steps which need PyMySQL).
+
+Steps:
+  1) Read and validate the site name           (test  ->  folder test.ir)
+  2) Resolve the install path, create the target folder
+     (never writes into an existing folder)
+  3) Download latest-fa_IR.zip into a temporary folder
+  4) Safely extract the ZIP (no path traversal) directly into the target folder
+  5) Fetch the security keys and salts from api.wordpress.org
+  6) Create wp-config.php
+  7) Connect to the database server
+  8) Check for the site database and create it (an existing one is never touched)
+  9) Print the final report
+
+Database user creation, privilege changes, the final WordPress installation,
+Apache configuration and SSL are intentionally NOT part of this script.
+
+Requirements (database steps only):
+  pip install PyMySQL          (pure-Python MySQL / MariaDB driver)
+  MySQL 8 accounts that use caching_sha2_password may also need:
+  pip install cryptography
+
+Console output:
+  Every message is printed through log_info / log_success / log_warning /
+  log_error / log_step (plus log_debug with -v) in this format:
+
+      [2026-10-15 21:45:32] [INFO] Downloading WordPress...
+
+  Colors are plain ANSI escape codes (no Colorama needed). They are used only
+  when the output is an interactive terminal that supports them. They are
+  switched off automatically when the output is redirected to a file or a pipe.
+  Environment variables:
+      NO_COLOR=1     never use colors
+      FORCE_COLOR=1  always use colors (e.g. when piping into `less -R`)
+
+Usage:
+  Linux  :  sudo python3 wp_installer.py
+  Windows:  py -3 wp_installer.py
+
+Minimum Python version: 3.8
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import os
+import re
+import shutil
+import socket
+import stat
+import sys
+import tempfile
+import traceback
+import urllib.error
+import urllib.request
+import zipfile
+import zlib
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, NoReturn, Optional, Sequence, Tuple
+
+# ======================================================================
+# Settings - in the future, only this section needs to change
+# ======================================================================
+
+WP_DOWNLOAD_URL = "https://fa.wordpress.org/latest-fa_IR.zip"
+WP_SALT_API_URL = "https://api.wordpress.org/secret-key/1.1/salt/"
+
+# Suffix of the site folder: input "test"  ->  folder "test.ir"
+SITE_FOLDER_SUFFIX = ".ir"
+
+# Base install directory
+LINUX_BASE_DIR = Path("/var/www/html")
+WINDOWS_DEFAULT_BASE_DIR = Path(r"C:\xampp\htdocs")  # can be changed at run time on Windows
+BASE_DIR_ENV_VAR = "WP_INSTALLER_BASE_DIR"  # override the base directory via environment variable
+
+# ----------------------------------------------------------------------
+# Database settings (written to wp-config.php and used to connect to the server)
+# ----------------------------------------------------------------------
+# WARNING: DB_USER and DB_PASSWORD are TEMPORARY TEST values that only exist for
+# the current phase of the project. Change them before any real use
+# (especially on a public server). DB_PASSWORD is never printed to the console.
+DB_NAME_SUFFIX = "_wp"  # database name = <site name without .ir> + this suffix  (test -> test_wp)
+DB_USER = "root"  # temporary test value
+DB_PASSWORD = "password"  # temporary test value
+DB_HOST = "localhost"  # host name only; the port is DB_PORT
+DB_PORT = 3306
+DB_CHARSET = "utf8mb4"
+DB_COLLATE = ""  # empty = pick the best collation the server supports (see DB_COLLATE_PREFERENCE)
+DB_COLLATE_PREFERENCE = ("utf8mb4_unicode_520_ci", "utf8mb4_unicode_ci", "utf8mb4_general_ci")
+TABLE_PREFIX = "wp_"
+
+# ----------------------------------------------------------------------
+# Limits and technical constants
+# ----------------------------------------------------------------------
+HTTP_TIMEOUT_SECONDS = 30
+DOWNLOAD_CHUNK_SIZE = 64 * 1024
+EXTRACT_CHUNK_SIZE = 64 * 1024
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # maximum size of the downloaded file
+MAX_SALT_RESPONSE_BYTES = 16 * 1024  # the real API response is about 600 bytes
+MAX_ZIP_ENTRIES = 20_000  # WordPress has roughly 4-5 thousand entries
+MAX_UNCOMPRESSED_BYTES = 500 * 1024 * 1024  # protection against ZIP bombs
+USER_AGENT = "wp-installer/1.0 (python-urllib)"
+
+DB_CONNECT_TIMEOUT_SECONDS = 10
+DB_OPERATION_TIMEOUT_SECONDS = 30
+DB_DRIVER_PIP_NAME = "PyMySQL"
+
+MYSQL_MAX_DB_NAME_LENGTH = 64
+MAX_SITE_NAME_LENGTH = MYSQL_MAX_DB_NAME_LENGTH - len(DB_NAME_SUFFIX)
+
+ZIP_ROOT_DIR = "wordpress"
+REQUIRED_WP_ITEMS = (
+    "index.php",
+    "wp-admin",
+    "wp-content",
+    "wp-includes",
+    "wp-load.php",
+    "wp-settings.php",
+)
+SALT_KEYS = (
+    "AUTH_KEY",
+    "SECURE_AUTH_KEY",
+    "LOGGED_IN_KEY",
+    "NONCE_KEY",
+    "AUTH_SALT",
+    "SECURE_AUTH_SALT",
+    "LOGGED_IN_SALT",
+    "NONCE_SALT",
+)
+
+# Names reserved on Windows (invalid even with an extension, e.g. con.ir)
+WINDOWS_RESERVED_NAMES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+# Lowercase English letters, digits and hyphens; must not start or end with a hyphen
+SITE_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?")
+# Character set / collation names cannot be sent as SQL parameters, so they are whitelisted
+_SQL_WORD_RE = re.compile(r"[a-z0-9_]+")
+# The database name cannot be a parameter either: strict whitelist, then quoted as an identifier
+_DB_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?")
+
+# Every line of the API response must look exactly like: define('AUTH_KEY', '...');
+_SALT_LINE_RE = re.compile(
+    r"define\(\s*'(?P<name>[A-Z_]+)'\s*,\s*'(?P<value>[^'\\\r\n]{32,})'\s*\)\s*;"
+)
+
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_INTERRUPT = 130
+
+# Short titles used by the final report
+STEP_TITLES: Dict[int, str] = {
+    1: "Read and validate the site name",
+    2: "Resolve install path and create target folder",
+    3: "Download Persian WordPress",
+    4: "Extract files",
+    5: "Fetch WordPress security keys",
+    6: "Create wp-config.php",
+    7: "Connect to the database server",
+    8: "Check and create the database",
+}
+
+# Console messages of every step: (when it starts, when it succeeded, when it failed).
+# The success text is only ever printed AFTER the step really finished without errors.
+STEP_MESSAGES: Dict[int, Tuple[str, str, str]] = {
+    1: (
+        "Validating site name...",
+        "Site name is valid.",
+        "Failed to validate the site name.",
+    ),
+    2: (
+        "Checking destination directory...",
+        "Destination directory created successfully.",
+        "Failed to prepare the destination directory.",
+    ),
+    3: (
+        "Downloading Persian WordPress...",
+        "WordPress downloaded successfully.",
+        "Failed to download WordPress.",
+    ),
+    4: (
+        "Extracting WordPress files...",
+        "WordPress files extracted successfully.",
+        "Failed to extract WordPress files.",
+    ),
+    5: (
+        "Retrieving WordPress security keys...",
+        "WordPress security keys retrieved successfully.",
+        "Failed to retrieve WordPress security keys.",
+    ),
+    6: (
+        "Creating wp-config.php...",
+        "wp-config.php created successfully.",
+        "Failed to create wp-config.php.",
+    ),
+    7: (
+        "Connecting to database server...",
+        "Database connection established.",
+        "Failed to connect to the database server.",
+    ),
+    8: (
+        "Checking database...",
+        "Database created successfully.",
+        "Failed to check or create the database.",
+    ),
+}
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+# ======================================================================
+# Console output: timestamps, colors and the log_* helpers
+# ======================================================================
+_ANSI_RESET = "\x1b[0m"
+_LEVEL_COLORS = {
+    "DEBUG": "\x1b[90m",  # gray
+    "INFO": "\x1b[94m",  # blue
+    "SUCCESS": "\x1b[92m",  # green
+    "WARNING": "\x1b[93m",  # yellow
+    "ERROR": "\x1b[91m",  # red
+    "STEP": "\x1b[96m",  # cyan
+}
+_ANSI_SEQUENCE_RE = re.compile(r"\x1b\[[0-9;]*m")
+_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_MIN_SECRET_LENGTH = 8  # shorter values would also match ordinary words
+
+
+@lru_cache(maxsize=1)
+def _enable_windows_ansi() -> bool:
+    """Turn on ANSI escape processing for the Windows console (Windows 10 and newer)."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if mode.value & _ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            return True
+        return bool(kernel32.SetConsoleMode(handle, mode.value | _ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    except Exception:  # noqa: BLE001 - no ctypes or no real console: simply no colors
+        return False
+
+
+def supports_color(stream: Any) -> bool:
+    """Decide whether ANSI colors may be written to `stream`."""
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR", "0") not in ("", "0"):
+        if is_windows():
+            _enable_windows_ansi()  # best effort
+        return True
+    isatty = getattr(stream, "isatty", None)
+    if not callable(isatty) or not isatty():
+        return False  # redirected to a file or a pipe
+    if os.environ.get("TERM") == "dumb":
+        return False
+    if is_windows():
+        return _enable_windows_ansi()
+    return True
+
+
+class Console:
+    """Timestamped console output, colored when the terminal supports it."""
+
+    def __init__(self) -> None:
+        self.verbose = False
+        self._secrets: List[str] = []
+
+    # -- secret protection ---------------------------------------------
+    def add_secret(self, value: str) -> None:
+        """Never print `value`: it is replaced by *** in every message."""
+        if len(value) >= _MIN_SECRET_LENGTH and value not in self._secrets:
+            self._secrets.append(value)
+
+    def clear_secrets(self) -> None:
+        self._secrets.clear()
+
+    def _redact(self, text: str) -> str:
+        for secret in self._secrets:
+            text = text.replace(secret, "***")
+        return text
+
+    # -- formatting ----------------------------------------------------
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def format_line(self, level: str, text: str, color: bool, timestamp: Optional[str] = None) -> str:
+        """One output line: [timestamp] [LEVEL] text, wrapped in color + reset if `color`."""
+        line = f"[{timestamp or self._timestamp()}] [{level}] {text}"
+        return f"{_LEVEL_COLORS[level]}{line}{_ANSI_RESET}" if color else line
+
+    # -- output --------------------------------------------------------
+    def emit(self, level: str, message: Any) -> None:
+        if level == "DEBUG" and not self.verbose:
+            return
+        stream = sys.stdout  # looked up on every call so redirection always works
+        color = supports_color(stream)
+        stamp = self._timestamp()
+        # Multi-line messages (e.g. tracebacks): every line gets its own timestamp and tag
+        lines = self._redact(str(message)).splitlines() or [""]
+        output = "\n".join(self.format_line(level, line, color, stamp) for line in lines) + "\n"
+        try:
+            stream.write(output)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            stream.write(output.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        stream.flush()
+
+    def ask(self, message: str) -> str:
+        """Prompt the user, using the same [timestamp] [INFO] format as every other message."""
+        color = supports_color(sys.stdout)
+        prompt = self.format_line("INFO", self._redact(message), color) + " "
+        if color and "readline" in sys.modules:
+            # readline must be told which characters take no screen width
+            prompt = _ANSI_SEQUENCE_RE.sub(lambda m: f"\x01{m.group(0)}\x02", prompt)
+        return input(prompt)
+
+
+_console = Console()
+
+
+def log_info(message: Any) -> None:
+    """General information (blue)."""
+    _console.emit("INFO", message)
+
+
+def log_success(message: Any) -> None:
+    """An operation finished successfully (green). Call it only after success is confirmed."""
+    _console.emit("SUCCESS", message)
+
+
+def log_warning(message: Any) -> None:
+    """Something needs attention but did not stop the run (yellow)."""
+    _console.emit("WARNING", message)
+
+
+def log_error(message: Any) -> None:
+    """An operation failed (red)."""
+    _console.emit("ERROR", message)
+
+
+def log_step(message: Any) -> None:
+    """A new step is starting (cyan)."""
+    _console.emit("STEP", message)
+
+
+def log_debug(message: Any) -> None:
+    """Troubleshooting details (gray); printed only when running with -v."""
+    _console.emit("DEBUG", message)
+
+
+def ask_input(message: str) -> str:
+    return _console.ask(message)
+
+
+# ======================================================================
+# Errors - each one has its own exit code
+# ======================================================================
+class InstallerError(Exception):
+    """Base installer error; its message is safe to show to the user."""
+
+    exit_code = 1
+
+
+class InputValidationError(InstallerError):
+    exit_code = 2
+
+
+class BaseDirError(InstallerError):
+    exit_code = 2
+
+
+class TargetExistsError(InstallerError):
+    exit_code = 3
+
+
+class PathPermissionError(InstallerError):
+    exit_code = 4
+
+
+class DownloadError(InstallerError):
+    exit_code = 5
+
+
+class ExtractionError(InstallerError):
+    exit_code = 6
+
+
+class SecurityKeysError(InstallerError):
+    exit_code = 7
+
+
+class ConfigError(InstallerError):
+    exit_code = 8
+
+
+class DatabaseDriverError(InstallerError):
+    exit_code = 9
+
+
+class DatabaseConnectionError(InstallerError):
+    exit_code = 10
+
+
+class DatabaseExistsError(InstallerError):
+    exit_code = 11
+
+
+class DatabaseCreateError(InstallerError):
+    exit_code = 12
+
+
+# ======================================================================
+# Data model
+# ======================================================================
+@dataclass
+class InstallContext:
+    """State of one run; used to clean up exactly what this run created."""
+
+    site_name: str = ""
+    base_dir: Optional[Path] = None
+    target_dir: Optional[Path] = None
+    temp_dir: Optional[Path] = None
+    config_path: Optional[Path] = None
+    created_files: List[Path] = field(default_factory=list)
+    created_dirs: List[Path] = field(default_factory=list)
+    extracted_files: int = 0
+    extracted_dirs: int = 0
+    db_connection: Optional[Any] = field(default=None, repr=False)  # closed in run_installer's finally
+    db_created_name: Optional[str] = None  # set only when THIS run created the database
+
+
+@dataclass(frozen=True)
+class DbSettings:
+    name: str
+    user: str = DB_USER
+    password: str = field(default=DB_PASSWORD, repr=False)  # never shown in logs / repr
+    host: str = DB_HOST
+    port: int = DB_PORT
+    charset: str = DB_CHARSET
+    collate: str = DB_COLLATE
+    table_prefix: str = TABLE_PREFIX
+
+
+@dataclass
+class ExtractStats:
+    files: int = 0
+    dirs: int = 0
+    bytes_written: int = 0
+
+
+# ======================================================================
+# Step 1: site name
+# ======================================================================
+def validate_site_name(raw: str) -> str:
+    """Validate and normalize (lowercase) the site name."""
+    name = raw.strip().lower()
+    if not name:
+        raise InputValidationError("Site name must not be empty.")
+    if "/" in name or "\\" in name or ".." in name:
+        raise InputValidationError(
+            "Site name must not contain a path, a path separator (/ or \\) or '..'."
+        )
+    if "." in name:
+        raise InputValidationError(
+            f"Site name must not contain a dot; the '{SITE_FOLDER_SUFFIX}' suffix is "
+            f"added automatically (e.g. enter 'test')."
+        )
+    if len(name) > MAX_SITE_NAME_LENGTH:
+        raise InputValidationError(
+            f"Site name must not be longer than {MAX_SITE_NAME_LENGTH} characters "
+            f"(MySQL database name length limit)."
+        )
+    if not SITE_NAME_RE.fullmatch(name):
+        raise InputValidationError(
+            "Site name may only contain English letters, digits and hyphens (-), "
+            "and must not start or end with a hyphen."
+        )
+    if name in WINDOWS_RESERVED_NAMES:
+        raise InputValidationError(f"'{name}' is a reserved name on Windows; please choose another name.")
+    return name
+
+
+def prompt_site_name(max_attempts: int = 3) -> str:
+    """Ask for the site name interactively; ask again a few times if it is invalid."""
+    last_error = "No valid input received."
+    for _ in range(max_attempts):
+        try:
+            raw = ask_input("Enter the site name (e.g. test):")
+        except EOFError as exc:
+            raise InputValidationError(
+                "No input received (stdin is closed). Use the --name option instead."
+            ) from exc
+        try:
+            return validate_site_name(raw)
+        except InputValidationError as exc:
+            last_error = str(exc)
+            log_error(f"Invalid input: {exc}")
+    raise InputValidationError(f"{last_error} (too many attempts)")
+
+
+def obtain_site_name(cli_name: Optional[str]) -> str:
+    if cli_name is not None:
+        name = validate_site_name(cli_name)
+        raw = cli_name.strip()
+    else:
+        name = prompt_site_name()
+        raw = name
+    if raw != name:
+        log_info(f"Site name was converted to lowercase: {name}")
+    log_info(f"Site name: {name}  ->  folder: {name}{SITE_FOLDER_SUFFIX}")
+    return name
+
+
+# ======================================================================
+# Step 2: path and target folder
+# ======================================================================
+def resolve_base_dir(cli_value: Optional[str], interactive: Optional[bool] = None) -> Path:
+    """
+    Base directory selection order:
+      --base-dir  >  WP_INSTALLER_BASE_DIR environment variable  >  OS default
+    On Windows, if no value was given and the terminal is interactive, the
+    path is requested from the user.
+    """
+    if interactive is None:
+        interactive = sys.stdin is not None and sys.stdin.isatty()
+
+    raw = cli_value or os.environ.get(BASE_DIR_ENV_VAR)
+    if raw:
+        base = Path(raw.strip().strip("\"'"))
+    elif is_windows():
+        base = WINDOWS_DEFAULT_BASE_DIR
+        if interactive:
+            try:
+                answer = ask_input(f"Base install directory [{base}] (press Enter for the default):")
+            except EOFError:
+                answer = ""
+            answer = answer.strip().strip("\"'")
+            if answer:
+                base = Path(answer)
+    else:
+        base = LINUX_BASE_DIR
+
+    base = Path(os.path.expanduser(str(base)))
+    if not base.is_absolute():
+        raise BaseDirError(f"Base directory must be an absolute path: {base}")
+    if not base.exists():
+        raise BaseDirError(f"Base directory does not exist: {base}")
+    if not base.is_dir():
+        raise BaseDirError(f"Base directory is not a folder: {base}")
+    return base.resolve()
+
+
+def build_target_path(base_dir: Path, site_name: str) -> Path:
+    folder_name = f"{site_name}{SITE_FOLDER_SUFFIX}"
+    target = base_dir / folder_name
+    # Second line of defense: the target must be exactly one direct child of the base directory
+    if target.parent != base_dir or target.name != folder_name:
+        raise InputValidationError(f"Invalid target path: {target}")
+    return target
+
+
+def _permission_hint() -> str:
+    if is_windows():
+        return "Run the script with \"Run as administrator\" or check the folder permissions."
+    return "Run the script with sudo or check the ownership/permissions of the base directory."
+
+
+def create_target_dir(target: Path, ctx: InstallContext) -> None:
+    """Create the target folder; if it already exists, change nothing."""
+    if os.path.lexists(target):
+        raise TargetExistsError(
+            f"Target folder already exists and was left untouched: {target}"
+        )
+    try:
+        target.mkdir(parents=False, exist_ok=False)  # atomic; never overwrites, even in a race
+    except FileExistsError as exc:
+        raise TargetExistsError(
+            f"Target folder already exists and was left untouched: {target}"
+        ) from exc
+    except PermissionError as exc:
+        raise PathPermissionError(
+            f"Permission denied while creating the folder: {target}. {_permission_hint()}"
+        ) from exc
+    except OSError as exc:
+        raise InstallerError(f"Could not create the target folder ({target}): {exc}") from exc
+    ctx.created_dirs.append(target)
+
+
+# ======================================================================
+# HTTP helpers
+# ======================================================================
+@contextmanager
+def _open_https(url: str, timeout: float, error_cls: type) -> Iterator[Any]:
+    """
+    Open a safe GET request (timeout, HTTPS only after redirects, HTTP 200 only)
+    and convert every network error into `error_cls` with a clear message.
+    """
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if not response.geturl().lower().startswith("https://"):
+                raise error_cls(
+                    "The server redirected to a non-HTTPS URL; aborting for security reasons."
+                )
+            status = response.getcode()
+            if status != 200:
+                raise error_cls(f"Unexpected HTTP status: {status}")
+            yield response
+    except error_cls:
+        raise
+    except urllib.error.HTTPError as exc:
+        raise error_cls(f"Server responded with HTTP {exc.code} ({exc.reason}). URL: {url}") from exc
+    except urllib.error.URLError as exc:
+        raise error_cls(
+            f"Could not connect to the server: {exc.reason}. "
+            f"Check your internet connection, DNS, firewall or proxy. URL: {url}"
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise error_cls(f"Timed out after {timeout:g} seconds. URL: {url}") from exc
+    except http.client.HTTPException as exc:
+        raise error_cls(f"Connection was interrupted or the response was incomplete: {exc!r}") from exc
+    except OSError as exc:
+        raise error_cls(f"Network error: {exc}") from exc
+
+
+def _parse_content_length(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _fmt_size(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 * 1024):.1f} MB"
+
+
+# ======================================================================
+# Step 3: download
+# ======================================================================
+def create_temp_dir() -> Path:
+    try:
+        return Path(tempfile.mkdtemp(prefix="wp_installer_"))  # mode 0700 on Linux
+    except OSError as exc:
+        raise InstallerError(f"Could not create a temporary folder: {exc}") from exc
+
+
+def download_file(
+    url: str,
+    dest: Path,
+    *,
+    timeout: float = HTTP_TIMEOUT_SECONDS,
+    max_bytes: int = MAX_DOWNLOAD_BYTES,
+) -> int:
+    """
+    Stream the file into `dest` in chunks and return the number of bytes received.
+    An incomplete download (fewer bytes than Content-Length) or an empty one is a failure.
+    If the server sends no Content-Length, completeness is checked in the next
+    step by validating the ZIP archive.
+    """
+    received = 0
+    with _open_https(url, timeout, DownloadError) as response:
+        expected = _parse_content_length(response.headers.get("Content-Length"))
+        if expected is not None and expected > max_bytes:
+            raise DownloadError(
+                f"File size ({_fmt_size(expected)}) exceeds the allowed limit ({_fmt_size(max_bytes)})."
+            )
+        try:
+            output = open(dest, "wb")
+        except OSError as exc:
+            raise DownloadError(f"Could not create the temporary file ({dest}): {exc}") from exc
+        with output:
+            while True:
+                chunk = response.read(DOWNLOAD_CHUNK_SIZE)  # network errors reach _open_https from here
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > max_bytes:
+                    raise DownloadError(f"Received data exceeds the allowed limit ({_fmt_size(max_bytes)}).")
+                try:
+                    output.write(chunk)
+                except OSError as exc:
+                    raise DownloadError(
+                        f"Could not write to the temporary file (is there enough disk space?): {exc}"
+                    ) from exc
+        if received == 0:
+            raise DownloadError("The downloaded file is empty.")
+        if expected is not None and received != expected:
+            raise DownloadError(
+                f"Incomplete download: received {received} of {expected} bytes."
+            )
+    return received
+
+
+# ======================================================================
+# Step 4: safe ZIP extraction
+# ======================================================================
+def validate_zip_file(zip_path: Path) -> None:
+    try:
+        size = zip_path.stat().st_size
+    except OSError as exc:
+        raise ExtractionError(f"ZIP file is not accessible: {exc}") from exc
+    if size == 0:
+        raise ExtractionError("ZIP file is empty.")
+    if not zipfile.is_zipfile(zip_path):
+        raise ExtractionError("The downloaded file is not a valid ZIP archive (it may be incomplete or corrupted).")
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _split_member_path(name: str) -> List[str]:
+    """Split a ZIP member name into safe components; raise if it is unsafe."""
+    normalized = name.replace("\\", "/")
+    if "\x00" in normalized:
+        raise ExtractionError(f"Unsafe name in ZIP (NUL character): {name!r}")
+    parts = normalized.split("/")
+    if parts and parts[-1] == "":  # directories end with "/"
+        parts.pop()
+    if not parts:
+        raise ExtractionError(f"Empty name in ZIP: {name!r}")
+    for part in parts:
+        if part in ("", ".", ".."):
+            raise ExtractionError(f"Unsafe path in ZIP (path traversal or absolute path): {name!r}")
+        if ":" in part:
+            raise ExtractionError(f"Unsafe path in ZIP (drive letter or alternate data stream): {name!r}")
+    return parts
+
+
+def _preflight_zip(infos: Sequence[zipfile.ZipInfo]) -> None:
+    """Check the whole ZIP listing before a single byte is written."""
+    if not infos:
+        raise ExtractionError("ZIP file is empty.")
+    if len(infos) > MAX_ZIP_ENTRIES:
+        raise ExtractionError(f"ZIP entry count ({len(infos)}) exceeds the allowed limit ({MAX_ZIP_ENTRIES}).")
+    total = 0
+    for info in infos:
+        parts = _split_member_path(info.filename)
+        if parts[0] != ZIP_ROOT_DIR:
+            raise ExtractionError(
+                f"Unexpected ZIP layout: every entry must be inside the '{ZIP_ROOT_DIR}' folder: "
+                f"{info.filename!r}"
+            )
+        if not info.is_dir() and len(parts) < 2:
+            raise ExtractionError(f"Unexpected ZIP layout: {info.filename!r}")
+        if info.create_system == 3 and stat.S_ISLNK(info.external_attr >> 16):
+            raise ExtractionError(f"Symbolic links are not allowed in the ZIP: {info.filename!r}")
+        total += info.file_size
+    if total > MAX_UNCOMPRESSED_BYTES:
+        raise ExtractionError(
+            f"Uncompressed size ({_fmt_size(total)}) exceeds the allowed limit ({_fmt_size(MAX_UNCOMPRESSED_BYTES)})."
+        )
+
+
+def _ensure_dirs(path: Path, root: Path, ctx: InstallContext) -> None:
+    """Create the missing folders of a path and record only the new ones for rollback."""
+    if not _is_within(path, root):
+        raise ExtractionError(f"Unsafe path during extraction: {path}")
+    missing: List[Path] = []
+    current = path
+    while current != root and not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        directory.mkdir()
+        ctx.created_dirs.append(directory)
+
+
+def _extract_member(
+    zf: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    root: Path,
+    ctx: InstallContext,
+    stats: ExtractStats,
+) -> None:
+    parts = _split_member_path(info.filename)
+    relative = parts[1:]  # drop the "wordpress" folder so the content lands directly in the target
+    if not relative:
+        return
+    destination = root.joinpath(*relative)
+    if not _is_within(destination, root) or destination == root:
+        raise ExtractionError(f"Unsafe path in ZIP: {info.filename!r}")
+
+    if info.is_dir():
+        _ensure_dirs(destination, root, ctx)
+        stats.dirs += 1
+        return
+
+    _ensure_dirs(destination.parent, root, ctx)
+    written = 0
+    # Mode "xb": fails if the file already exists, so nothing is ever overwritten
+    with zf.open(info) as source, open(destination, "xb") as output:
+        ctx.created_files.append(destination)
+        while True:
+            chunk = source.read(EXTRACT_CHUNK_SIZE)
+            if not chunk:
+                break
+            written += len(chunk)
+            stats.bytes_written += len(chunk)
+            if written > info.file_size or stats.bytes_written > MAX_UNCOMPRESSED_BYTES:
+                raise ExtractionError(
+                    f"Actual file size does not match the size declared in the ZIP: {info.filename!r}"
+                )
+            output.write(chunk)
+    stats.files += 1
+
+
+def extract_zip_safely(zip_path: Path, target_dir: Path, ctx: InstallContext) -> ExtractStats:
+    """
+    Put the content of wordpress/ from the ZIP directly into target_dir.
+    Extraction is manual (not extractall) so every path is checked before writing.
+    """
+    root = target_dir.resolve()
+    stats = ExtractStats()
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            infos = zf.infolist()
+            _preflight_zip(infos)
+            corrupt = zf.testzip()
+            if corrupt is not None:
+                raise ExtractionError(f"Corrupted file inside the ZIP: {corrupt!r}")
+            for info in infos:
+                _extract_member(zf, info, root, ctx, stats)
+    except zipfile.BadZipFile as exc:
+        raise ExtractionError(f"ZIP file is corrupted: {exc}") from exc
+    except (RuntimeError, NotImplementedError, zipfile.LargeZipFile, zlib.error, EOFError) as exc:
+        raise ExtractionError(
+            f"Cannot read the ZIP (encrypted, unsupported compression or corrupted data): {exc}"
+        ) from exc
+    except PermissionError as exc:
+        raise PathPermissionError(
+            f"Permission denied while writing to the target ({exc.filename}). {_permission_hint()}"
+        ) from exc
+    except OSError as exc:
+        raise ExtractionError(f"File system error during extraction: {exc}") from exc
+    ctx.extracted_files = stats.files
+    ctx.extracted_dirs = stats.dirs
+    return stats
+
+
+def verify_wordpress_layout(target_dir: Path) -> None:
+    missing = [name for name in REQUIRED_WP_ITEMS if not (target_dir / name).exists()]
+    if missing:
+        raise ExtractionError(
+            "WordPress layout is incomplete after extraction; missing: " + ", ".join(missing)
+        )
+
+
+# ======================================================================
+# Step 5: security keys
+# ======================================================================
+def parse_security_keys(text: str) -> str:
+    """
+    Strictly validate the API response: exactly eight define() lines with the
+    known names, each once, with values that contain no quote or backslash.
+    Anything else is rejected (prevents PHP code injection). The values are
+    re-emitted unchanged in the standard format. The response content never
+    appears in error messages or logs.
+    """
+    found: Dict[str, str] = {}
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        match = _SALT_LINE_RE.fullmatch(line)
+        if match is None or match.group("name") not in SALT_KEYS:
+            raise SecurityKeysError(f"Invalid security keys API response format (line {line_no}).")
+        name = match.group("name")
+        if name in found:
+            raise SecurityKeysError(f"Key {name} is duplicated in the API response.")
+        found[name] = match.group("value")
+    missing = [key for key in SALT_KEYS if key not in found]
+    if missing:
+        raise SecurityKeysError("Incomplete API response; missing keys: " + ", ".join(missing))
+    return "\n".join(f"define('{key}', '{found[key]}');" for key in SALT_KEYS)
+
+
+def fetch_security_keys(
+    url: str = WP_SALT_API_URL, timeout: float = HTTP_TIMEOUT_SECONDS
+) -> str:
+    """Call the API once and return the block of define() lines (values are never logged)."""
+    with _open_https(url, timeout, SecurityKeysError) as response:
+        raw = response.read(MAX_SALT_RESPONSE_BYTES + 1)
+    if not raw:
+        raise SecurityKeysError("The security keys API response was empty.")
+    if len(raw) > MAX_SALT_RESPONSE_BYTES:
+        raise SecurityKeysError("The security keys API response is too large.")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise SecurityKeysError("The security keys API response is not valid UTF-8.") from None
+    return parse_security_keys(text)
+
+
+def _register_key_secrets(keys_block: str) -> None:
+    """
+    Safety net: even if some future code path tried to print a key or salt,
+    the console would replace it with ***. (The database password is not
+    registered because the script never prints it, and the word would also be
+    masked inside ordinary sentences.)
+    """
+    for line in keys_block.splitlines():
+        match = _SALT_LINE_RE.fullmatch(line.strip())
+        if match:
+            _console.add_secret(match.group("value"))
+
+
+# ======================================================================
+# Step 6: wp-config.php
+# ======================================================================
+def build_db_settings(site_name: str) -> DbSettings:
+    return DbSettings(name=f"{site_name}{DB_NAME_SUFFIX}")
+
+
+def php_quote(value: str) -> str:
+    """Convert a value into a safe single-quoted PHP string."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def render_wp_config(db: DbSettings, keys_block: str) -> str:
+    lines = [
+        "<?php",
+        "/**",
+        " * wp-config.php - generated by wp_installer.py",
+        " *",
+        " * WARNING: DB_USER and DB_PASSWORD below are TEMPORARY TEST values.",
+        " * Change them before using this site in production.",
+        " */",
+        "",
+        "// ** Database settings ** //",
+        f"define('DB_NAME', {php_quote(db.name)});",
+        f"define('DB_USER', {php_quote(db.user)});",
+        f"define('DB_PASSWORD', {php_quote(db.password)});",
+        f"define('DB_HOST', {php_quote(db.host)});",
+        f"define('DB_CHARSET', {php_quote(db.charset)});",
+        f"define('DB_COLLATE', {php_quote(db.collate)});",
+        "",
+        "// ** Authentication unique keys and salts ** //",
+        keys_block,
+        "",
+        "// ** Table prefix ** //",
+        f"$table_prefix = {php_quote(db.table_prefix)};",
+        "",
+        "// ** Debugging ** //",
+        "define('WP_DEBUG', false);",
+        "",
+        "// ** Absolute path to the WordPress directory ** //",
+        "if (!defined('ABSPATH')) {",
+        "    define('ABSPATH', __DIR__ . '/');",
+        "}",
+        "",
+        "// ** Sets up WordPress vars and included files ** //",
+        "require_once ABSPATH . 'wp-settings.php';",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def validate_wp_config(content: str) -> None:
+    """Before writing: every definition exactly once and the file must be complete."""
+    if not content.startswith("<?php"):
+        raise ConfigError("wp-config.php content does not start with <?php.")
+    singles = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_CHARSET", "DB_COLLATE", "WP_DEBUG", "ABSPATH")
+    for const in singles + SALT_KEYS:
+        count = content.count(f"define('{const}',")
+        if count != 1:
+            raise ConfigError(f"{const} must be defined exactly once (found: {count}).")
+    if content.count("$table_prefix") != 1:
+        raise ConfigError("$table_prefix must be defined exactly once.")
+    if content.count("require_once ABSPATH . 'wp-settings.php';") != 1:
+        raise ConfigError("The require_once line for wp-settings.php is missing or duplicated.")
+    if not content.rstrip().endswith("require_once ABSPATH . 'wp-settings.php';"):
+        raise ConfigError("wp-config.php must end with the require_once of wp-settings.php.")
+
+
+def write_wp_config(target_dir: Path, content: str, ctx: InstallContext) -> Path:
+    config_path = target_dir / "wp-config.php"
+    try:
+        # UTF-8 without BOM (a BOM makes PHP emit unwanted output) and LF line endings on both OSes
+        with open(config_path, "x", encoding="utf-8", newline="\n") as handle:
+            ctx.created_files.append(config_path)
+            handle.write(content)
+    except FileExistsError as exc:
+        raise ConfigError(f"wp-config.php already exists and will not be overwritten: {config_path}") from exc
+    except PermissionError as exc:
+        raise PathPermissionError(
+            f"Permission denied while writing wp-config.php: {config_path}. {_permission_hint()}"
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(f"Could not write wp-config.php: {exc}") from exc
+    return config_path
+
+
+# ======================================================================
+# Step 7: database server connection
+# ======================================================================
+def validate_db_name(name: str) -> str:
+    """Strict whitelist check of the database name (<site name>_wp); runs before any SQL is built."""
+    if not name.endswith(DB_NAME_SUFFIX):
+        raise InputValidationError(f"Database name must end with '{DB_NAME_SUFFIX}': {name!r}")
+    if len(name) > MYSQL_MAX_DB_NAME_LENGTH:
+        raise InputValidationError(
+            f"Database name must not be longer than {MYSQL_MAX_DB_NAME_LENGTH} characters: {name!r}"
+        )
+    if not _DB_NAME_RE.fullmatch(name):
+        raise InputValidationError(
+            f"Database name may only contain lowercase English letters, digits, hyphens and underscores: {name!r}"
+        )
+    return name
+
+
+def quote_sql_identifier(name: str) -> str:
+    """Quote a validated database name with backticks (an identifier cannot be an SQL parameter)."""
+    validate_db_name(name)
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _require_sql_word(value: str, label: str) -> str:
+    """Character set / collation names are put into the SQL text, so only plain words are accepted."""
+    if not _SQL_WORD_RE.fullmatch(value):
+        raise InputValidationError(
+            f"Invalid {label} setting: {value!r} (only lowercase letters, digits and underscores are allowed)."
+        )
+    return value
+
+
+def validate_db_settings(db: DbSettings) -> None:
+    """Reject invalid settings BEFORE any connection is made or any SQL is built."""
+    validate_db_name(db.name)
+    if not db.host.strip():
+        raise InputValidationError("Database host must not be empty.")
+    if not db.user:
+        raise InputValidationError("Database username must not be empty.")
+    if not isinstance(db.port, int) or isinstance(db.port, bool) or not 1 <= db.port <= 65535:
+        raise InputValidationError(f"Database port must be a number between 1 and 65535 (got: {db.port!r}).")
+    _require_sql_word(db.charset, "character set")
+    if db.collate:
+        _require_sql_word(db.collate, "collation")
+
+
+def load_db_driver() -> Any:
+    """Import PyMySQL only when it is needed, so the earlier steps never depend on it."""
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise DatabaseDriverError(
+            f"The database driver '{DB_DRIVER_PIP_NAME}' is not installed. "
+            f"Install it with:  {sys.executable} -m pip install {DB_DRIVER_PIP_NAME}"
+        ) from exc
+    return pymysql
+
+
+def _db_error_code(exc: BaseException) -> Optional[int]:
+    """Numeric MySQL / MariaDB error code of a driver exception, if it has one."""
+    if exc.args and isinstance(exc.args[0], int):
+        return exc.args[0]
+    return None
+
+
+def _db_error_message(exc: BaseException, password: str) -> str:
+    """Server message of a driver error with the password masked (the server never sends it, but be safe)."""
+    text = str(exc.args[1]) if len(exc.args) > 1 else str(exc)
+    if password:
+        keep = "using password:"  # the standard "(using password: YES)" wording is not a leak
+        text = text.replace(keep, "\0").replace(password, "***").replace("\0", keep)
+    return text
+
+
+def _connection_error(exc: BaseException, db: DbSettings) -> InstallerError:
+    """Translate a driver error raised while connecting into a clear, secret-free message."""
+    code = _db_error_code(exc)
+    text = _db_error_message(exc, db.password)
+    log_debug(f"Driver error ({type(exc).__name__}): {text}")
+    where = f"{db.host}:{db.port}"
+    if code == 1045:
+        return DatabaseConnectionError(
+            f"Authentication failed for user '{db.user}' on {where} (wrong username or password). "
+            f"Check DB_USER and DB_PASSWORD in the settings section."
+        )
+    if code == 1130:
+        return DatabaseConnectionError(
+            f"The server at {where} does not allow user '{db.user}' to connect from this machine."
+        )
+    if code in (1251, 2059):
+        return DatabaseDriverError(
+            f"The driver cannot use the authentication method required by the server at {where}. "
+            f"Try:  {sys.executable} -m pip install --upgrade {DB_DRIVER_PIP_NAME} cryptography"
+        )
+    if "timed out" in text.lower():
+        return DatabaseConnectionError(
+            f"Timed out after {DB_CONNECT_TIMEOUT_SECONDS:g} seconds while connecting to {where}. "
+            f"Check that the server is running and reachable (firewall, host and port)."
+        )
+    if code == 2005:
+        return DatabaseConnectionError(f"Could not resolve the database host name '{db.host}'. Check DB_HOST.")
+    if code in (2002, 2003):
+        return DatabaseConnectionError(
+            f"Could not connect to the database server at {where}. The server may not be running, "
+            f"the port may be wrong (DB_PORT) or a firewall may be blocking the connection."
+        )
+    if code == 1040:
+        return DatabaseConnectionError(f"The database server at {where} has too many open connections.")
+    suffix = f" (error {code})" if code is not None else ""
+    return DatabaseConnectionError(
+        f"Could not connect to the database server at {where}{suffix}: {text}. "
+        f"Check DB_HOST and DB_PORT, and make sure a MySQL / MariaDB server is listening there."
+    )
+
+
+def connect_to_database(db: DbSettings, ctx: InstallContext) -> None:
+    """
+    Connect with the configured settings (with timeouts) and keep the connection in
+    ctx.db_connection; run_installer's finally block closes it. Error messages
+    never contain the password.
+    """
+    pymysql = load_db_driver()
+    where = f"{db.host}:{db.port}"
+    try:
+        connection = pymysql.connect(
+            host=db.host,
+            port=db.port,
+            user=db.user,
+            password=db.password,
+            connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=DB_OPERATION_TIMEOUT_SECONDS,
+            write_timeout=DB_OPERATION_TIMEOUT_SECONDS,
+            autocommit=True,
+        )
+    except pymysql.err.MySQLError as exc:
+        raise _connection_error(exc, db) from None  # the redacted details were logged as DEBUG
+    except RuntimeError as exc:
+        if "cryptography" not in str(exc):
+            raise
+        raise DatabaseDriverError(
+            "The server requires an authentication method (caching_sha2_password / sha256_password) "
+            f"that needs the 'cryptography' package. Install it with:  {sys.executable} -m pip install cryptography"
+        ) from exc
+    except OSError as exc:  # also covers socket timeouts
+        raise DatabaseConnectionError(f"Network error while connecting to {where}: {exc}") from exc
+    ctx.db_connection = connection
+    log_info(f"Connected to {where} as '{db.user}' (server version: {connection.get_server_info()}).")
+
+
+def close_database_connection(ctx: InstallContext) -> None:
+    """Close the connection if one is open; called from run_installer's finally block."""
+    connection, ctx.db_connection = ctx.db_connection, None
+    if connection is None:
+        return
+    try:
+        connection.close()
+    except Exception as exc:  # noqa: BLE001 - a broken connection must not hide the real result
+        log_warning(f"Could not close the database connection cleanly ({type(exc).__name__}).")
+    else:
+        log_info("Database connection closed.")
+
+
+# ======================================================================
+# Step 8: check for the database and create it
+# ======================================================================
+def _existing_database_error(name: str) -> DatabaseExistsError:
+    """WARNING for an already existing database; the caller raises the returned error to stop the run."""
+    log_warning(
+        f"Database {name} already exists. It was left untouched: nothing was dropped or overwritten, "
+        f"and the steps that depend on creating a new database were stopped."
+    )
+    return DatabaseExistsError(
+        f"Database {name} already exists. Use a different site name, or remove / rename the existing "
+        f"database manually if you really want to reuse the name."
+    )
+
+
+def _database_operation_error(exc: BaseException, db: DbSettings, name: str) -> InstallerError:
+    """Translate a driver error raised while checking / creating the database."""
+    code = _db_error_code(exc)
+    text = _db_error_message(exc, db.password)
+    log_debug(f"Driver error ({type(exc).__name__}): {text}")
+    if code == 1007:  # created by someone else (or not visible to this user) between check and create
+        return _existing_database_error(name)
+    if code in (1044, 1142, 1227):
+        return DatabaseCreateError(
+            f"User '{db.user}' is not allowed to create the database {name} (error {code}). "
+            f"Grant it the CREATE privilege (on {name} or on *.*), or set another account in DB_USER / "
+            f"DB_PASSWORD. Privileges are not changed by this script."
+        )
+    if code in (2006, 2013) or "timed out" in text.lower():
+        return DatabaseCreateError(
+            f"Lost the connection to the database server (operation timeout: "
+            f"{DB_OPERATION_TIMEOUT_SECONDS:g} seconds). The database may or may not have been created; "
+            f"please check the server."
+        )
+    suffix = f" (error {code})" if code is not None else ""
+    return DatabaseCreateError(f"Could not check or create the database {name}{suffix}: {text}")
+
+
+def database_exists(cursor: Any, name: str) -> bool:
+    """
+    Exact-name lookup with a bound parameter. (SHOW DATABASES LIKE is avoided on purpose:
+    "_" is a wildcard in LIKE, so test_wp would also match testXwp.)
+    """
+    cursor.execute("SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s", (name,))
+    return cursor.fetchone() is not None
+
+
+def select_collation(cursor: Any, db: DbSettings) -> str:
+    """Pick the collation: DB_COLLATE if set, otherwise the first supported entry of DB_COLLATE_PREFERENCE."""
+    cursor.execute(
+        "SELECT COLLATION_NAME FROM information_schema.COLLATIONS WHERE CHARACTER_SET_NAME = %s",
+        (db.charset,),
+    )
+    available = {str(row[0]).lower() for row in cursor.fetchall()}
+    if not available:
+        raise DatabaseCreateError(
+            f"The database server does not support the '{db.charset}' character set "
+            f"(WordPress needs utf8mb4: MySQL 5.5.3+ / MariaDB 5.5+)."
+        )
+    if db.collate:
+        if db.collate.lower() not in available:
+            raise DatabaseCreateError(f"The collation '{db.collate}' set in DB_COLLATE is not supported by this server.")
+        return _require_sql_word(db.collate.lower(), "collation")
+    for candidate in DB_COLLATE_PREFERENCE:
+        if candidate in available:
+            return _require_sql_word(candidate, "collation")
+    raise DatabaseCreateError(
+        "None of the preferred collations is supported by this server: " + ", ".join(DB_COLLATE_PREFERENCE)
+    )
+
+
+def check_and_create_database(ctx: InstallContext, db: DbSettings) -> None:
+    """
+    Create the site database if it does not exist. An existing database is never
+    touched (no DROP, no table is changed): a WARNING is logged and the run stops.
+    CREATE DATABASE is deliberately sent without IF NOT EXISTS, so a race can never
+    be mistaken for success. Whether the account may create databases is decided by
+    the server itself (the real CREATE DATABASE), and its refusal is reported clearly.
+    """
+    connection = ctx.db_connection
+    if connection is None:
+        raise DatabaseConnectionError("There is no open database connection; the connection step must succeed first.")
+    if ctx.db_created_name is not None:
+        raise DatabaseCreateError(
+            f"Database {ctx.db_created_name} was already created in this run; it will not be created again."
+        )
+    name = validate_db_name(db.name)
+    charset = _require_sql_word(db.charset, "character set")
+    pymysql = load_db_driver()
+    log_info(f"Database name: {name}")
+    try:
+        with connection.cursor() as cursor:  # the cursor is always closed, even on errors
+            if database_exists(cursor, name):
+                raise _existing_database_error(name)
+            collation = select_collation(cursor, db)
+            log_info("Database does not exist. Creating database...")
+            log_info(f"Character set: {charset}, collation: {collation}")
+            cursor.execute(f"CREATE DATABASE {quote_sql_identifier(name)} CHARACTER SET {charset} COLLATE {collation}")
+            ctx.db_created_name = name  # recorded only after the server accepted the statement
+    except InstallerError:
+        raise
+    except pymysql.err.MySQLError as exc:
+        raise _database_operation_error(exc, db, name) from None  # the redacted details were logged as DEBUG
+    except OSError as exc:  # also covers socket timeouts
+        raise DatabaseCreateError(f"Network error while talking to the database server: {exc}") from exc
+
+
+# ======================================================================
+# Cleanup
+# ======================================================================
+def cleanup_temp_dir(temp_dir: Optional[Path]) -> None:
+    if temp_dir is None:
+        return
+    try:
+        shutil.rmtree(temp_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log_warning(f"Could not remove the temporary folder ({temp_dir}): {exc}")
+    else:
+        log_info("Temporary files removed.")
+
+
+def rollback(ctx: InstallContext) -> None:
+    """Remove only the files and folders that this run created and recorded."""
+    if not ctx.created_files and not ctx.created_dirs:
+        return
+    log_warning("Cleaning up what this run created ...")
+    leftovers = 0
+    for file_path in reversed(ctx.created_files):
+        try:
+            file_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            leftovers += 1
+            log_warning(f"Could not remove file ({file_path}): {exc}")
+    for directory in sorted(ctx.created_dirs, key=lambda p: len(p.parts), reverse=True):
+        try:
+            directory.rmdir()  # only succeeds if empty; other people's content is never deleted
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            leftovers += 1
+            log_warning(f"Could not remove folder ({directory}): {exc}")
+    if leftovers:
+        log_warning(f"{leftovers} item(s) could not be removed; please check them manually.")
+    else:
+        log_info("Cleanup finished.")
+
+
+# ======================================================================
+# Step reporting
+# ======================================================================
+class StepReporter:
+    def __init__(self) -> None:
+        self._results: Dict[int, bool] = {}
+
+    def record(self, number: int, ok: bool) -> None:
+        self._results[number] = ok
+
+    def status(self, number: int) -> str:
+        if number not in self._results:
+            return "skipped"
+        return "ok" if self._results[number] else "failed"
+
+
+@contextmanager
+def step(reporter: StepReporter, number: int) -> Iterator[None]:
+    """
+    Announce a step (STEP), run it, and report the outcome: SUCCESS only after the
+    body finished without an exception, ERROR if it raised. The exception itself
+    is re-raised so the caller handles it exactly as before.
+    """
+    start_message, success_message, failure_message = STEP_MESSAGES[number]
+    log_step(start_message)
+    try:
+        yield
+    except BaseException as exc:
+        reporter.record(number, False)
+        if isinstance(exc, Exception):  # Ctrl+C is reported once, by the caller
+            log_error(failure_message)
+        raise
+    reporter.record(number, True)
+    log_success(success_message)
+
+
+def ensure_previous_steps_succeeded(reporter: StepReporter, number: int) -> None:
+    """Refuse to start step `number` unless every earlier step finished successfully."""
+    for previous in range(1, number):
+        if reporter.status(previous) != "ok":
+            raise InstallerError(
+                f"Cannot start step {number}: step {previous} ({STEP_TITLES[previous]}) did not complete successfully."
+            )
+
+
+def print_report(reporter: StepReporter, ctx: InstallContext, exit_code: int) -> None:
+    log_step("Step 9: Final report")
+    for number, title in STEP_TITLES.items():
+        status = reporter.status(number)
+        if status == "ok":
+            log_success(f"Step {number}: {title}")
+        elif status == "failed":
+            log_error(f"Step {number}: {title} - FAILED")
+        else:
+            log_warning(f"Step {number}: {title} - skipped")
+    if (
+        exit_code == EXIT_OK
+        and ctx.target_dir is not None
+        and ctx.config_path is not None
+        and ctx.db_created_name is not None
+    ):
+        db = build_db_settings(ctx.site_name)
+        log_success("Result: SUCCESS")
+        log_info(f"Final install path: {ctx.target_dir}")
+        log_info(f"WordPress files: created ({ctx.extracted_files} files, {ctx.extracted_dirs} folders)")
+        log_info("wp-config.php: created")
+        log_info(f"Database: {ctx.db_created_name} created on {db.host}:{db.port}")
+        log_warning("The database user and password are TEMPORARY TEST values; change them before real use.")
+        log_info(
+            "Note: database user creation, privilege changes, the final WordPress installation, "
+            "Apache configuration and SSL are not performed by this script."
+        )
+    else:
+        log_error(f"Result: FAILED (exit code {exit_code})")
+
+
+# ======================================================================
+# Main flow
+# ======================================================================
+def run_installer(
+    name_arg: Optional[str] = None,
+    base_dir_arg: Optional[str] = None,
+    verbose: bool = False,
+) -> int:
+    _console.verbose = verbose
+    reporter = StepReporter()
+    ctx = InstallContext()
+    exit_code = EXIT_OK
+    try:
+        with step(reporter, 1):
+            ctx.site_name = obtain_site_name(name_arg)
+
+        with step(reporter, 2):
+            ctx.base_dir = resolve_base_dir(base_dir_arg)
+            ctx.target_dir = build_target_path(ctx.base_dir, ctx.site_name)
+            create_target_dir(ctx.target_dir, ctx)
+            log_info(f"Target path: {ctx.target_dir}")
+
+        with step(reporter, 3):
+            ctx.temp_dir = create_temp_dir()
+            zip_path = ctx.temp_dir / "latest-fa_IR.zip"
+            log_info(f"Downloading from the official URL: {WP_DOWNLOAD_URL}")
+            size = download_file(WP_DOWNLOAD_URL, zip_path)
+            log_info(f"Received {_fmt_size(size)}.")
+
+        with step(reporter, 4):
+            validate_zip_file(zip_path)
+            stats = extract_zip_safely(zip_path, ctx.target_dir, ctx)
+            verify_wordpress_layout(ctx.target_dir)
+            log_info(f"Extracted {stats.files} files and {stats.dirs} folders.")
+
+        with step(reporter, 5):
+            keys_block = fetch_security_keys()
+            _register_key_secrets(keys_block)
+            log_info("Security keys received and validated (values are never printed).")
+
+        with step(reporter, 6):
+            db = build_db_settings(ctx.site_name)
+            content = render_wp_config(db, keys_block)
+            validate_wp_config(content)
+            ctx.config_path = write_wp_config(ctx.target_dir, content, ctx)
+            log_info(f"Config file written: {ctx.config_path}")
+
+        ensure_previous_steps_succeeded(reporter, 7)  # database work only after steps 1-6 succeeded
+
+        with step(reporter, 7):
+            validate_db_settings(db)  # invalid settings are rejected before any connection
+            log_info(f"Database server: {db.host}:{db.port}, user: {db.user} (password is never printed)")
+            connect_to_database(db, ctx)
+
+        with step(reporter, 8):
+            check_and_create_database(ctx, db)
+
+    except InstallerError as exc:
+        log_error(f"Reason: {exc}")
+        log_debug("Technical details:\n" + traceback.format_exc())
+        exit_code = exc.exit_code
+    except KeyboardInterrupt:
+        log_error("Operation cancelled by the user.")
+        exit_code = EXIT_INTERRUPT
+    except Exception as exc:  # noqa: BLE001 - last line of defense; troubleshooting info is shown
+        log_error(f"Unexpected error ({type(exc).__name__}): {exc}")
+        log_debug("Technical details:\n" + traceback.format_exc())
+        if not verbose:
+            log_info("Run with -v to see the full traceback.")
+        exit_code = EXIT_FAILURE
+    finally:
+        close_database_connection(ctx)
+        cleanup_temp_dir(ctx.temp_dir)
+
+    if exit_code != EXIT_OK:
+        rollback(ctx)
+        if ctx.db_created_name is not None:  # only possible if the run was interrupted right after CREATE
+            log_warning(
+                f"Database {ctx.db_created_name} was created by this run and was left in place "
+                f"(databases are never dropped automatically)."
+            )
+
+    print_report(reporter, ctx, exit_code)
+    return exit_code
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+class _ArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser whose usage errors use the same timestamped log format."""
+
+    def error(self, message: str) -> NoReturn:
+        log_error(f"{self.prog}: {message}")
+        log_info(f"Run '{self.prog} --help' to see the available options.")
+        raise SystemExit(2)
+
+
+def _configure_console_encoding() -> None:
+    """Make output UTF-8 so non-ASCII paths do not raise encoding errors on Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = _ArgumentParser(
+        prog="wp_installer.py",
+        description="Download and prepare Persian WordPress (Windows / Linux).",
+    )
+    parser.add_argument(
+        "--name",
+        help="Site name without the suffix (e.g. test). If omitted, you will be prompted.",
+    )
+    parser.add_argument(
+        "--base-dir",
+        help=(
+            f"Base install directory. Linux default: {LINUX_BASE_DIR}. "
+            f"On Windows you are prompted at run time (or set the {BASE_DIR_ENV_VAR} environment variable)."
+        ),
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show troubleshooting details (traceback)")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    _configure_console_encoding()
+    args = parse_args(argv)
+    return run_installer(args.name, args.base_dir, args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
