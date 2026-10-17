@@ -50,15 +50,19 @@ from __future__ import annotations
 
 import argparse
 import http.client
+import json
 import os
 import re
 import shutil
 import socket
+import ssl
 import stat
 import sys
 import tempfile
+import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 import zlib
@@ -77,7 +81,7 @@ WP_DOWNLOAD_URL = "https://fa.wordpress.org/latest-fa_IR.zip"
 WP_SALT_API_URL = "https://api.wordpress.org/secret-key/1.1/salt/"
 
 # Suffix of the site folder: input "test"  ->  folder "test.ir"
-SITE_FOLDER_SUFFIX = ".ir"
+SITE_FOLDER_SUFFIX = "smabf.ir"
 
 # Base install directory
 LINUX_BASE_DIR = Path("/var/www/html")
@@ -99,6 +103,44 @@ DB_CHARSET = "utf8mb4"
 DB_COLLATE = ""  # empty = pick the best collation the server supports (see DB_COLLATE_PREFERENCE)
 DB_COLLATE_PREFERENCE = ("utf8mb4_unicode_520_ci", "utf8mb4_unicode_ci", "utf8mb4_general_ci")
 TABLE_PREFIX = "wp_"
+
+# ----------------------------------------------------------------------
+# Arvan Cloud DNS settings (DNS / Apache / SSL phase)
+# ----------------------------------------------------------------------
+# The API token is NEVER stored in this file: it is read from the environment variable below.
+ARVAN_API_BASE_URL = "https://napi.arvancloud.ir/cdn/4.0"
+ARVAN_TOKEN_ENV_VAR = "ARVAN_API_TOKEN"
+ARVAN_PLACEHOLDER_TOKENS = frozenset({"YOUR_ARVAN_API_TOKEN", "YOUR_FAKE_ARVAN_API_KEY_REPLACE_ME"})
+ARVAN_HTTP_TIMEOUT_SECONDS = 30
+DNS_ZONE = "smabf.ir"  # sites are published as <site name>.smabf.ir
+SERVER_IP = "109.122.250.181"  # the origin server (value of the DNS A record)
+DNS_RECORD_TTL = 120
+ARVAN_ALLOWED_METHODS = ("GET", "POST", "PUT")  # DELETE is deliberately not supported
+MAX_ARVAN_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_ARVAN_ERROR_BODY_BYTES = 16 * 1024
+ARVAN_DNS_PAGE_SIZE = 50
+ARVAN_MAX_DNS_PAGES = 100
+DNS_POST_MAX_ATTEMPTS = 2  # at most one repeat, and only after the DNS state was re-checked
+DNS_RECHECK_DELAY_SECONDS = 3  # short pause before re-checking after an unclear POST
+
+# ----------------------------------------------------------------------
+# Apache settings (Linux only)
+# ----------------------------------------------------------------------
+APACHE_SITES_AVAILABLE_DIR = Path("/etc/apache2/sites-available")
+# @FQDN@ and @DOCROOT@ are replaced by the script; ${APACHE_LOG_DIR} is an Apache variable and stays as is.
+APACHE_VHOST_TEMPLATE = """\
+<VirtualHost *:80>
+    ServerName @FQDN@
+    ServerAdmin webmaster@localhost
+    DocumentRoot @DOCROOT@
+    <Directory @DOCROOT@>
+        AllowOverride All
+        Require all granted
+    </Directory>
+    ErrorLog ${APACHE_LOG_DIR}/@FQDN@-error.log
+    CustomLog ${APACHE_LOG_DIR}/@FQDN@-access.log combined
+</VirtualHost>
+"""
 
 # ----------------------------------------------------------------------
 # Limits and technical constants
@@ -427,6 +469,36 @@ class DatabaseExistsError(InstallerError):
 class DatabaseCreateError(InstallerError):
     exit_code = 12
 
+class ArvanConfigError(InstallerError):
+    """The Arvan API token is missing or unusable (the message never contains the token)."""
+
+    exit_code = 13
+
+class ArvanApiError(InstallerError):
+    """An Arvan API call failed (HTTP error reply, invalid reply or network error)."""
+
+    exit_code = 14
+
+    def __init__(self, message: str, status_code: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code  # HTTP status of the reply, if there was one
+
+
+class ArvanOutcomeUnknownError(ArvanApiError):
+    """
+    The request may or may not have been processed (timeout, interrupted connection,
+    HTTP 5xx or an unreadable 2xx reply). Check the real state before repeating a POST.
+    """
+
+class DnsRecordError(InstallerError):
+    """The DNS A record can not be created or conflicts with an existing record."""
+
+    exit_code = 15
+
+class ApacheConfigError(InstallerError):
+    """The Apache virtual host config can not be created or checked."""
+
+    exit_code = 16
 
 # ======================================================================
 # Data model
@@ -1286,6 +1358,445 @@ def check_and_create_database(ctx: InstallContext, db: DbSettings) -> None:
     except OSError as exc:  # also covers socket timeouts
         raise DatabaseCreateError(f"Network error while talking to the database server: {exc}") from exc
 
+# ======================================================================
+# Arvan Cloud: token and site domain
+# ======================================================================
+def build_site_fqdn(site_name: str) -> str:
+    """Full domain of a site: 'test' -> 'test.smabf.ir' (site_name is already validated)."""
+    return f"{site_name}.{DNS_ZONE}"
+
+
+def get_arvan_token() -> str:
+    """
+    Read the Arvan API token from the environment and register it with the console
+    so it is replaced by *** in every log message. The token itself is never logged.
+    """
+    token = os.environ.get(ARVAN_TOKEN_ENV_VAR, "").strip()
+    if not token:
+        raise ArvanConfigError(
+            f"Environment variable {ARVAN_TOKEN_ENV_VAR} is not set (or is empty). "
+            f"Example: export {ARVAN_TOKEN_ENV_VAR}='<your Arvan API key>'"
+        )
+    if token.upper() in ARVAN_PLACEHOLDER_TOKENS:
+        raise ArvanConfigError(
+            f"{ARVAN_TOKEN_ENV_VAR} still contains the sample placeholder; set your real Arvan API key."
+        )
+    if any(ch.isspace() for ch in token) or not token.isascii():
+        raise ArvanConfigError(
+            f"{ARVAN_TOKEN_ENV_VAR} must contain only the key itself: no spaces, "
+            f"no 'Apikey ' prefix and no non-ASCII characters."
+        )
+    if len(token) < _MIN_SECRET_LENGTH:
+        raise ArvanConfigError(f"{ARVAN_TOKEN_ENV_VAR} is too short to be a valid API key.")
+    _console.add_secret(token)
+    return token
+
+# ======================================================================
+# Arvan Cloud: API client
+# ======================================================================
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects, so the Authorization header can not be sent to another URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+_ARVAN_OPENER = urllib.request.build_opener(_NoRedirectHandler)  # TLS verification stays on (default)
+
+# Errors that happen before any byte of the request was sent: the outcome is NOT unknown
+_ARVAN_NOT_SENT_ERRORS = (socket.gaierror, ConnectionRefusedError, ssl.SSLError)
+
+_ARVAN_STATUS_HINTS = {
+    401: "authentication failed (the API key is invalid or expired)",
+    403: "access denied (the API key has no permission for this operation)",
+    404: "not found",
+    422: "the request data was rejected as invalid",
+    429: "rate limit reached, try again later",
+}
+
+
+def arvan_dns_records_path(record_id: Optional[str] = None) -> str:
+    """API path of the zone's DNS records, or of a single record."""
+    base = f"/domains/{DNS_ZONE}/dns-records"
+    if record_id is None:
+        return base
+    record_id = str(record_id).strip()
+    if not record_id:
+        raise ArvanApiError("DNS record id must not be empty.")
+    return f"{base}/{urllib.parse.quote(record_id, safe='')}"
+
+
+def _arvan_error_detail(body: bytes) -> str:
+    """Human-readable part of an Arvan error reply: 'message' plus the per-field 'errors'."""
+    try:
+        info = json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError:
+        return ""
+    if not isinstance(info, dict):
+        return ""
+    parts: List[str] = []
+    message = info.get("message")
+    if isinstance(message, str) and message.strip():
+        parts.append(message.strip())
+    errors = info.get("errors")
+    if isinstance(errors, dict):
+        for field_name, problems in errors.items():
+            texts = problems if isinstance(problems, list) else [problems]
+            parts.append(f"{field_name}: " + ", ".join(str(text) for text in texts))
+    return "; ".join(parts)[:500]
+
+
+def _arvan_http_error(method: str, path: str, exc: urllib.error.HTTPError) -> ArvanApiError:
+    """Convert an HTTP error reply into an ArvanApiError (5xx: the outcome is unknown)."""
+    try:
+        body = exc.read(MAX_ARVAN_ERROR_BODY_BYTES)
+    except (OSError, http.client.HTTPException):
+        body = b""
+    hint = _ARVAN_STATUS_HINTS.get(exc.code, "unexpected response")
+    message = f"Arvan API {method} {path} failed: HTTP {exc.code} - {hint}"
+    if exc.code == 429 and exc.headers is not None and exc.headers.get("Retry-After"):
+        message += f" (Retry-After: {exc.headers.get('Retry-After')}s)"
+    detail = _arvan_error_detail(body)
+    if detail:
+        message += f". Details: {detail}"
+    error_cls = ArvanOutcomeUnknownError if exc.code >= 500 else ArvanApiError
+    return error_cls(message, exc.code)
+
+
+def arvan_request(
+    method: str,
+    path: str,
+    token: str,
+    payload: Optional[Dict[str, Any]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = ARVAN_HTTP_TIMEOUT_SECONDS,
+) -> Any:
+    """
+    Call the Arvan CDN API over HTTPS and return the decoded JSON reply (None if empty).
+
+    Only GET, POST and PUT are possible. Redirects are never followed and TLS
+    verification is never disabled. The request is never repeated here: a failed
+    POST must be re-checked by the caller first. ArvanOutcomeUnknownError means the
+    request may have been processed. The token is never logged.
+    """
+    method = method.upper()
+    if method not in ARVAN_ALLOWED_METHODS:
+        raise ArvanApiError(f"HTTP method {method} is not allowed (this script never deletes DNS records).")
+    if not ARVAN_API_BASE_URL.lower().startswith("https://"):
+        raise ArvanApiError("The Arvan API base URL must use HTTPS.")
+    if not path.startswith("/"):
+        raise ArvanApiError(f"Invalid Arvan API path: {path}")
+    url = ARVAN_API_BASE_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = {
+        "Authorization": f"Apikey {token}",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    where = f"{method} {path}"
+    unknown_hint = "The request may or may not have been processed; check the DNS state before repeating it."
+    log_debug(f"Arvan API request: {where}")
+    try:
+        with _ARVAN_OPENER.open(request, timeout=timeout) as response:
+            status = response.getcode()
+            raw = response.read(MAX_ARVAN_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise _arvan_http_error(method, path, exc) from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            raise ArvanOutcomeUnknownError(
+                f"Arvan API {where} timed out after {timeout:g} seconds. {unknown_hint}"
+            ) from exc
+        if isinstance(reason, _ARVAN_NOT_SENT_ERRORS):
+            raise ArvanApiError(f"Could not connect to the Arvan API ({where}): {reason}") from exc
+        raise ArvanOutcomeUnknownError(
+            f"Connection to the Arvan API failed during {where}: {reason}. {unknown_hint}"
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise ArvanOutcomeUnknownError(
+            f"Arvan API {where} timed out after {timeout:g} seconds. {unknown_hint}"
+        ) from exc
+    except (http.client.HTTPException, ConnectionError) as exc:
+        raise ArvanOutcomeUnknownError(
+            f"Connection to the Arvan API was interrupted during {where}: {exc!r}. {unknown_hint}"
+        ) from exc
+    except OSError as exc:
+        raise ArvanApiError(f"Network error while calling the Arvan API ({where}): {exc}") from exc
+
+    log_debug(f"Arvan API response: {where} -> HTTP {status}")
+    if len(raw) > MAX_ARVAN_RESPONSE_BYTES:
+        raise ArvanOutcomeUnknownError(
+            f"Reply of the Arvan API is too large ({where}, HTTP {status}). {unknown_hint}", status
+        )
+    if not raw.strip():
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ArvanOutcomeUnknownError(
+            f"Arvan API returned an invalid (non-JSON) reply ({where}, HTTP {status}). {unknown_hint}", status
+        ) from exc
+
+# ======================================================================
+# Arvan Cloud: DNS A record
+# ======================================================================
+@dataclass(frozen=True)
+class DnsRecordResult:
+    record: Dict[str, Any]  # the record as returned by Arvan (it contains the 'id')
+    created: bool  # True: created by this run, False: it already existed
+
+
+def arvan_list_dns_records(token: str) -> List[Dict[str, Any]]:
+    """
+    Read ALL DNS records of the zone, page by page (read-only). The list must be complete,
+    otherwise an existing record could be missed and duplicated, so any doubt is an error.
+    """
+    records: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in range(1, ARVAN_MAX_DNS_PAGES + 1):
+        reply = arvan_request(
+            "GET",
+            arvan_dns_records_path(),
+            token,
+            params={"page": page, "per_page": ARVAN_DNS_PAGE_SIZE},
+        )
+        items = reply.get("data") if isinstance(reply, dict) else None
+        if not isinstance(items, list):
+            raise ArvanApiError("Unexpected reply while listing DNS records (no 'data' list).")
+        if not items:
+            log_debug(f"DNS records: {len(records)} read in {page - 1} page(s)")
+            return records
+        fresh = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("id") or json.dumps(item, sort_keys=True))
+            if key not in seen:
+                seen.add(key)
+                records.append(item)
+                fresh += 1
+        if fresh == 0:
+            raise ArvanApiError(
+                "The Arvan API repeated an earlier page of DNS records; the list can not be read completely."
+            )
+    raise ArvanApiError(
+        f"The zone has more than {ARVAN_MAX_DNS_PAGES} pages of DNS records; "
+        f"refusing to continue with an incomplete list."
+    )
+
+
+def _dns_record_ips(record: Dict[str, Any]) -> List[str]:
+    value = record.get("value")
+    if not isinstance(value, list):
+        return []
+    return [str(item.get("ip", "")).strip() for item in value if isinstance(item, dict)]
+
+
+def _same_name_dns_records(records: List[Dict[str, Any]], site_name: str) -> List[Dict[str, Any]]:
+    names = {site_name.lower(), build_site_fqdn(site_name).lower()}
+    return [r for r in records if str(r.get("name", "")).strip().rstrip(".").lower() in names]
+
+
+def check_dns_state(token: str, site_name: str) -> Optional[Dict[str, Any]]:
+    """
+    Read-only DNS check for <site_name>.<zone>. Returns the exact A record (one IP, SERVER_IP)
+    if it exists and None if the name is free. A different A/CNAME/ANAME record under the same
+    name raises DnsRecordError: such a record is never modified or removed by this script.
+    """
+    fqdn = build_site_fqdn(site_name)
+    exact: List[Dict[str, Any]] = []
+    conflicts: List[str] = []
+    for record in _same_name_dns_records(arvan_list_dns_records(token), site_name):
+        record_type = str(record.get("type", "")).lower()
+        if record_type not in ("a", "cname", "aname"):
+            continue  # other types (TXT, MX, ...) do not conflict with an A record
+        ips = _dns_record_ips(record)
+        if record_type == "a" and ips == [SERVER_IP]:
+            exact.append(record)
+        else:
+            value = record.get("value")
+            host = value.get("host") if isinstance(value, dict) else None
+            shown = ", ".join(ips) or (str(host) if host else "-")
+            conflicts.append(f"{record_type.upper()} (id {record.get('id', '?')}, value: {shown})")
+    if conflicts:
+        raise DnsRecordError(
+            f"{fqdn} already has a different DNS record: {'; '.join(conflicts)}. Nothing was changed; "
+            f"fix or remove it in the Arvan panel, or choose another site name."
+        )
+    if len(exact) > 1:
+        log_warning(f"{len(exact)} identical A records exist for {fqdn}; using the first one (none are removed).")
+    return exact[0] if exact else None
+
+
+def build_dns_a_record_payload(site_name: str) -> Dict[str, Any]:
+    """Body of the POST that creates the A record (the Arvan cloud proxy stays off for now)."""
+    return {
+        "type": "a",
+        "name": site_name,
+        "value": [{"ip": SERVER_IP, "port": None, "weight": 100, "country": ""}],
+        "ttl": DNS_RECORD_TTL,
+        "cloud": False,
+        "upstream_https": "default",
+        "ip_filter_mode": {"count": "single", "order": "none", "geo_filter": "none"},
+    }
+
+
+def _recheck_dns_state(token: str, site_name: str, problem: str) -> Optional[Dict[str, Any]]:
+    """Re-read the DNS state after an unclear POST; if that fails too, stop (the POST is not repeated)."""
+    try:
+        return check_dns_state(token, site_name)
+    except ArvanApiError as exc:
+        raise DnsRecordError(
+            f"{problem} The DNS state could not be verified ({exc}); the request was not repeated. "
+            f"Check the Arvan panel."
+        ) from exc
+
+
+def ensure_dns_a_record(token: str, site_name: str) -> DnsRecordResult:
+    """
+    Make sure <site_name>.<zone> has the A record -> SERVER_IP, without ever creating a duplicate.
+    An existing exact record is reused; a conflicting record stops the run (nothing is changed).
+    After a timeout or unclear reply of the POST, the DNS state is re-checked before the POST
+    is repeated (at most once). Nothing is deleted or rolled back.
+    """
+    fqdn = build_site_fqdn(site_name)
+    existing = check_dns_state(token, site_name)
+    if existing is not None:
+        log_info(
+            f"DNS A record {fqdn} -> {SERVER_IP} already exists (id {existing.get('id', '?')}); "
+            f"not creating a duplicate."
+        )
+        return DnsRecordResult(existing, created=False)
+
+    payload = build_dns_a_record_payload(site_name)
+    reply: Any = None
+    for attempt in range(1, DNS_POST_MAX_ATTEMPTS + 1):
+        try:
+            reply = arvan_request("POST", arvan_dns_records_path(), token, payload=payload)
+            break
+        except ArvanOutcomeUnknownError as exc:
+            log_warning(f"Creating {fqdn} (attempt {attempt}): {exc}")
+            time.sleep(DNS_RECHECK_DELAY_SECONDS)
+            found = _recheck_dns_state(token, site_name, f"Creating {fqdn}: the request outcome is unclear.")
+            if found is not None:
+                log_success(f"DNS A record {fqdn} -> {SERVER_IP} exists (confirmed after an unclear reply).")
+                return DnsRecordResult(found, created=True)
+            if attempt == DNS_POST_MAX_ATTEMPTS:
+                raise DnsRecordError(
+                    f"Could not create {fqdn}: the request outcome stayed unclear and the record "
+                    f"was not found afterwards. Check the Arvan panel."
+                ) from exc
+            log_warning(f"The record {fqdn} does not exist yet; repeating the request once.")
+        except ArvanApiError as exc:
+            raise DnsRecordError(f"Could not create DNS record {fqdn}: {exc}") from exc
+
+    data = reply.get("data") if isinstance(reply, dict) else None
+    if isinstance(data, dict) and data.get("id"):
+        log_success(f"DNS A record created: {fqdn} -> {SERVER_IP} (id {data['id']}, Arvan cloud proxy off).")
+        return DnsRecordResult(data, created=True)
+    found = _recheck_dns_state(token, site_name, f"Creating {fqdn}: the reply contained no record id.")
+    if found is None:
+        raise DnsRecordError(f"Creating {fqdn} was accepted but the record was not found afterwards. Check the Arvan panel.")
+    log_success(f"DNS A record {fqdn} -> {SERVER_IP} exists (id {found.get('id', '?')}).")
+    return DnsRecordResult(found, created=True)
+
+# ======================================================================
+# Apache: virtual host config (Linux only)
+# ======================================================================
+@dataclass(frozen=True)
+class ApacheConfigResult:
+    conf_path: Path
+    created: bool  # True: written by this run, False: an identical file already existed
+
+
+def is_linux() -> bool:
+    return sys.platform.startswith("linux")
+
+
+def check_apache_prerequisites() -> None:
+    """The Apache steps need Linux, root privileges and an Apache sites-available directory."""
+    if not is_linux():
+        raise ApacheConfigError("The Apache steps are supported on Linux only.")
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise ApacheConfigError(
+            "The Apache steps need root privileges (writing to /etc/apache2). Run the script with sudo."
+        )
+    if not APACHE_SITES_AVAILABLE_DIR.is_dir():
+        raise ApacheConfigError(f"{APACHE_SITES_AVAILABLE_DIR} was not found. Is Apache installed?")
+
+
+def build_apache_vhost_config(site_name: str, document_root: Path) -> str:
+    """Content of <site>.smabf.ir.conf. The DocumentRoot folder must be named exactly like the domain."""
+    fqdn = build_site_fqdn(site_name)
+    docroot = str(document_root)
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", docroot):
+        raise ApacheConfigError(
+            f"DocumentRoot must be an absolute path with only letters, digits and _ . / - : {docroot!r}"
+        )
+    if document_root.name != fqdn:
+        raise ApacheConfigError(
+            f"The install folder is named {document_root.name!r} but the DocumentRoot folder must be "
+            f"named {fqdn!r} (see SITE_FOLDER_SUFFIX)."
+        )
+    return APACHE_VHOST_TEMPLATE.replace("@FQDN@", fqdn).replace("@DOCROOT@", docroot)
+
+
+def create_apache_vhost_config(site_name: str, document_root: Path) -> ApacheConfigResult:
+    """
+    Create <sites-available>/<site>.smabf.ir.conf. An existing file is never overwritten:
+    an identical one is reused, a different one stops the run. The file is written to a
+    temporary file first and then linked into place, so a half-written config never exists.
+    """
+    content = build_apache_vhost_config(site_name, document_root)
+    if not document_root.is_dir() or not (document_root / "wp-config.php").is_file():
+        raise ApacheConfigError(
+            f"DocumentRoot {document_root} does not contain an installed WordPress (wp-config.php is missing); "
+            f"the Apache config was not created."
+        )
+    conf_name = f"{build_site_fqdn(site_name)}.conf"
+    conf_path = APACHE_SITES_AVAILABLE_DIR / conf_name
+    if not APACHE_SITES_AVAILABLE_DIR.is_dir():
+        raise ApacheConfigError(f"{APACHE_SITES_AVAILABLE_DIR} was not found. Is Apache installed?")
+
+    if conf_path.exists() or conf_path.is_symlink():
+        try:
+            existing = conf_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ApacheConfigError(f"{conf_path} already exists and can not be read: {exc}") from exc
+        if existing == content:
+            log_info(f"Apache config {conf_path} already exists with the expected content; reusing it.")
+            return ApacheConfigResult(conf_path, created=False)
+        raise ApacheConfigError(
+            f"{conf_path} already exists with different content and was NOT modified. "
+            f"Review it, or remove it manually if it is not needed."
+        )
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{conf_name}.", suffix=".tmp", dir=str(APACHE_SITES_AVAILABLE_DIR))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp_name, 0o644)
+        os.link(tmp_name, conf_path)  # fails if the name appeared in the meantime
+    except FileExistsError as exc:
+        raise ApacheConfigError(f"{conf_path} appeared while this script was running; it was not overwritten.") from exc
+    except OSError as exc:
+        raise ApacheConfigError(f"Could not write {conf_path}: {exc}") from exc
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+    log_success(f"Apache config created: {conf_path} (DocumentRoot {document_root})")
+    return ApacheConfigResult(conf_path, created=True)
 
 # ======================================================================
 # Cleanup
