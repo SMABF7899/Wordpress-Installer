@@ -157,6 +157,13 @@ HTTP_CHECK_ATTEMPTS = 3  # only repeated when curl itself failed (e.g. connectio
 HTTP_CHECK_INTERVAL_SECONDS = 3
 
 # ----------------------------------------------------------------------
+# Certbot / Let's Encrypt settings (Linux only)
+# ----------------------------------------------------------------------
+CERTBOT_EMAIL_ENV_VAR = "CERTBOT_EMAIL"
+CERTBOT_TIMEOUT_SECONDS = 300  # domain validation and installation can take a while
+LETSENCRYPT_LIVE_DIR = Path("/etc/letsencrypt/live")
+
+# ----------------------------------------------------------------------
 # Limits and technical constants
 # ----------------------------------------------------------------------
 HTTP_TIMEOUT_SECONDS = 30
@@ -523,6 +530,11 @@ class SiteCheckError(InstallerError):
     """A DNS or HTTP check of the new site failed."""
 
     exit_code = 18
+
+class CertbotError(InstallerError):
+    """The SSL certificate could not be obtained or installed with Certbot."""
+
+    exit_code = 19
 
 # ======================================================================
 # Data model
@@ -2065,6 +2077,103 @@ def check_site_reachability(site_name: str, expect_origin: bool = True) -> SiteC
     ping_ok = check_ping(site_name)
     head = check_http_access(site_name)
     return SiteCheckResult(dns_ips, ping_ok, head.status)
+
+# ======================================================================
+# SSL certificate with Certbot (Linux only)
+# ======================================================================
+@dataclass(frozen=True)
+class CertbotResult:
+    cert_name: str
+    live_dir: Path  # <live dir>/<cert name>: holds fullchain.pem and privkey.pem
+    dry_run: bool  # True: only a test against the staging server, nothing was saved or installed
+
+
+# (text to look for in the lower-cased Certbot output, hint for the user)
+_CERTBOT_HINTS = [
+    ("too many certificates", "Let's Encrypt rate limit reached; wait before trying again."),
+    ("too many failed", "Let's Encrypt rate limit for failed validations reached; fix the cause and wait an hour."),
+    ("ratelimited", "Let's Encrypt rate limit reached; wait before trying again."),
+    ("nxdomain", "The name does not resolve for Let's Encrypt; check the DNS record and wait for propagation."),
+    ("dns problem", "Let's Encrypt could not resolve the name; check the DNS record and wait for propagation."),
+    ("timeout during connect", "Let's Encrypt could not reach port 80 of this server; check the firewall and the DNS target."),
+    ("connection refused", "Let's Encrypt could not connect to port 80; is Apache running and the port open?"),
+    ("plugin does not appear to be installed", "Install the Apache plugin: sudo apt install python3-certbot-apache"),
+    ("another instance of certbot is already running", "Another Certbot is running; wait for it to finish."),
+]
+
+
+def _tail(text: str, limit: int = 1500) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else "...[truncated] " + text[-limit:]
+
+
+def get_certbot_email() -> str:
+    """Contact email for Let's Encrypt, read from the CERTBOT_EMAIL environment variable."""
+    email = os.environ.get(CERTBOT_EMAIL_ENV_VAR, "").strip()
+    if not email:
+        raise CertbotError(
+            f"Environment variable {CERTBOT_EMAIL_ENV_VAR} is not set (or is empty). "
+            f"Example: export {CERTBOT_EMAIL_ENV_VAR}='you@your-domain.com'"
+        )
+    if email.startswith("-") or not email.isascii() or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise CertbotError(f"{CERTBOT_EMAIL_ENV_VAR} is not a valid email address.")
+    domain = email.rsplit("@", 1)[1].lower()
+    if domain in ("example.com", "example.org", "example.net"):
+        raise CertbotError(f"{CERTBOT_EMAIL_ENV_VAR} still contains a sample address; Let's Encrypt rejects it.")
+    return email
+
+
+def build_certbot_command(site_name: str, email: str, dry_run: bool = False) -> List[str]:
+    """
+    Real run: 'certbot --apache' (obtain + install + HTTP->HTTPS redirect) against the Production server.
+    Dry run: 'certbot certonly --apache --dry-run' (staging server; nothing is saved or installed).
+    --keep-until-expiring: an existing valid certificate is reused instead of being issued again.
+    """
+    fqdn = build_site_fqdn(site_name)
+    common = [
+        "--non-interactive", "--agree-tos", "--no-eff-email",
+        f"--email={email}",
+        "--cert-name", fqdn,
+        "-d", fqdn,
+    ]
+    if dry_run:
+        return ["certbot", "certonly", "--apache", "--dry-run", *common]
+    return ["certbot", "--apache", "--redirect", "--keep-until-expiring", *common]
+
+
+def obtain_ssl_certificate(site_name: str, dry_run: bool = False) -> CertbotResult:
+    """
+    Get and install a Let's Encrypt certificate for <site>.<zone> with Certbot. The Arvan cloud proxy
+    must still be OFF so that Let's Encrypt reaches this server directly. Nothing is rolled back on
+    failure. A real run is checked only for its files here; the Production issuer is verified separately.
+    """
+    check_apache_prerequisites()
+    if shutil.which("certbot") is None:
+        raise CertbotError("certbot was not found. Install it, e.g.: sudo apt install certbot python3-certbot-apache")
+    email = get_certbot_email()
+    fqdn = build_site_fqdn(site_name)
+    kind = "a TEST (dry-run, staging)" if dry_run else "a Production"
+    log_info(f"Requesting {kind} certificate for {fqdn} with Certbot (this can take a minute)...")
+    try:
+        result = run_command(build_certbot_command(site_name, email, dry_run), timeout=CERTBOT_TIMEOUT_SECONDS)
+    except CommandError as exc:
+        raise CertbotError(f"{exc}. Check 'certbot certificates' before trying again; nothing was rolled back.") from exc
+    if result.returncode != 0:
+        lowered = result.output.lower()
+        hints = [hint for needle, hint in _CERTBOT_HINTS if needle in lowered]
+        hint_text = (" Hint: " + " ".join(dict.fromkeys(hints))) if hints else ""
+        raise CertbotError(
+            f"certbot failed (exit code {result.returncode}).{hint_text} Output (end): {_tail(result.output)}"
+        )
+    live_dir = LETSENCRYPT_LIVE_DIR / fqdn
+    if dry_run:
+        log_success("Certbot dry-run succeeded: validation works. No certificate was saved or installed.")
+        return CertbotResult(fqdn, live_dir, True)
+    for file_name in ("fullchain.pem", "privkey.pem"):
+        if not (live_dir / file_name).is_file():
+            raise CertbotError(f"certbot reported success but {live_dir / file_name} does not exist.")
+    log_success(f"Certbot finished: certificate files are in {live_dir}")
+    return CertbotResult(fqdn, live_dir, False)
 
 # ======================================================================
 # Cleanup
