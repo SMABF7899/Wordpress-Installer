@@ -57,6 +57,7 @@ import shutil
 import socket
 import ssl
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -127,6 +128,8 @@ DNS_RECHECK_DELAY_SECONDS = 3  # short pause before re-checking after an unclear
 # Apache settings (Linux only)
 # ----------------------------------------------------------------------
 APACHE_SITES_AVAILABLE_DIR = Path("/etc/apache2/sites-available")
+APACHE_SITES_ENABLED_DIR = Path("/etc/apache2/sites-enabled")
+COMMAND_TIMEOUT_SECONDS = 60  # limit for every external command (a2ensite, apache2ctl, ...)
 # @FQDN@ and @DOCROOT@ are replaced by the script; ${APACHE_LOG_DIR} is an Apache variable and stays as is.
 APACHE_VHOST_TEMPLATE = """\
 <VirtualHost *:80>
@@ -499,6 +502,11 @@ class ApacheConfigError(InstallerError):
     """The Apache virtual host config can not be created or checked."""
 
     exit_code = 16
+
+class CommandError(InstallerError):
+    """An external command could not be started or did not finish in time."""
+
+    exit_code = 17
 
 # ======================================================================
 # Data model
@@ -1797,6 +1805,110 @@ def create_apache_vhost_config(site_name: str, document_root: Path) -> ApacheCon
             pass
     log_success(f"Apache config created: {conf_path} (DocumentRoot {document_root})")
     return ApacheConfigResult(conf_path, created=True)
+
+# ======================================================================
+# External commands
+# ======================================================================
+@dataclass(frozen=True)
+class CommandResult:
+    returncode: int
+    output: str  # stdout and stderr together, stripped
+
+
+def _short(text: str, limit: int = 1500) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + " ...[truncated]"
+
+
+def run_command(args: List[str], timeout: float = COMMAND_TIMEOUT_SECONDS) -> CommandResult:
+    """Run an external command without a shell and capture stdout and stderr together."""
+    log_debug("Running command: " + " ".join(args))
+    try:
+        completed = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except FileNotFoundError as exc:
+        raise CommandError(f"Command not found: {args[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CommandError(f"Command timed out after {timeout:g} seconds: {' '.join(args)}") from exc
+    except OSError as exc:
+        raise CommandError(f"Could not run {args[0]}: {exc}") from exc
+    return CommandResult(completed.returncode, (completed.stdout or "").strip())
+
+
+# ======================================================================
+# Apache: enable, test and reload (Linux only)
+# ======================================================================
+def enable_apache_site(conf_path: Path) -> bool:
+    """Enable the site with a2ensite. Returns True if this run enabled it, False if it already was."""
+    enabled_path = APACHE_SITES_ENABLED_DIR / conf_path.name
+    if os.path.lexists(enabled_path):
+        try:
+            same = enabled_path.resolve() == conf_path.resolve()
+        except OSError:
+            same = False
+        if same:
+            log_info(f"Apache site {conf_path.name} is already enabled.")
+            return False
+        raise ApacheConfigError(f"{enabled_path} already exists but does not point to {conf_path}; it was not touched.")
+    result = run_command(["a2ensite", conf_path.name])
+    if result.returncode != 0:
+        raise ApacheConfigError(
+            f"a2ensite {conf_path.name} failed (exit code {result.returncode}): {_short(result.output)}"
+        )
+    if not os.path.lexists(enabled_path):
+        raise ApacheConfigError(f"a2ensite reported success but {enabled_path} does not exist.")
+    log_success(f"Apache site enabled: {conf_path.name}")
+    return True
+
+
+def apache_configtest() -> None:
+    """apache2ctl configtest; success needs exit code 0 and 'Syntax OK' in the output."""
+    result = run_command(["apache2ctl", "configtest"])
+    if result.returncode != 0 or "Syntax OK" not in result.output:
+        raise ApacheConfigError(
+            f"apache2ctl configtest failed (exit code {result.returncode}): {_short(result.output)}"
+        )
+    log_success("Apache configuration test passed (Syntax OK).")
+
+
+def reload_apache() -> None:
+    """Reload Apache (systemctl, or apache2ctl graceful when systemctl does not exist)."""
+    command = ["systemctl", "reload", "apache2"] if shutil.which("systemctl") else ["apache2ctl", "graceful"]
+    result = run_command(command)
+    if result.returncode != 0:
+        raise ApacheConfigError(
+            f"{' '.join(command)} failed (exit code {result.returncode}). The configuration test had passed; "
+            f"check 'systemctl status apache2'. Output: {_short(result.output)}"
+        )
+    log_success("Apache reloaded.")
+
+
+def activate_apache_site(conf_path: Path) -> bool:
+    """
+    Enable the site, run configtest and reload Apache ONLY if the test passed.
+    Returns True if this run enabled the site. Nothing is rolled back on failure; the error
+    says exactly what state was left behind.
+    """
+    enabled_now = enable_apache_site(conf_path)
+    try:
+        apache_configtest()
+    except (ApacheConfigError, CommandError) as exc:
+        undo = f" To disable it manually: sudo a2dissite {conf_path.name}" if enabled_now else ""
+        raise ApacheConfigError(
+            f"{exc} The site {conf_path.name} is enabled but Apache was NOT reloaded "
+            f"(the running configuration is unchanged); nothing was rolled back.{undo}"
+        ) from exc
+    reload_apache()
+    return enabled_now
 
 # ======================================================================
 # Cleanup
