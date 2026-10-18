@@ -1973,8 +1973,9 @@ def check_dns_resolution(site_name: str, expect_origin: bool = True) -> List[str
         time.sleep(DNS_POLL_INTERVAL_SECONDS)
     if not ips:
         raise SiteCheckError(
-            f"{fqdn} does not resolve after {DNS_WAIT_SECONDS} seconds. The record exists in Arvan, so this is "
-            f"usually DNS propagation or a cached negative answer on this server; wait a few minutes and retry."
+            f"{fqdn} does not resolve after {DNS_WAIT_SECONDS} seconds. If the record was only just created, "
+            f"this is usually DNS propagation or a cached negative answer on this server; otherwise check that "
+            f"the record exists in Arvan and that smabf.ir uses Arvan's name servers."
         )
     raise SiteCheckError(
         f"{fqdn} resolves to {', '.join(ips)} but the origin IP {SERVER_IP} was expected "
