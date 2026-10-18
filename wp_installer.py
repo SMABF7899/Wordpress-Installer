@@ -162,6 +162,7 @@ HTTP_CHECK_INTERVAL_SECONDS = 3
 CERTBOT_EMAIL_ENV_VAR = "CERTBOT_EMAIL"
 CERTBOT_TIMEOUT_SECONDS = 300  # domain validation and installation can take a while
 LETSENCRYPT_LIVE_DIR = Path("/etc/letsencrypt/live")
+SSL_MIN_VALID_DAYS = 7  # a certificate that expires sooner than this is refused
 
 # ----------------------------------------------------------------------
 # Limits and technical constants
@@ -535,6 +536,11 @@ class CertbotError(InstallerError):
     """The SSL certificate could not be obtained or installed with Certbot."""
 
     exit_code = 19
+
+class SslCheckError(InstallerError):
+    """The installed SSL certificate or the port 443 virtual host is not correct."""
+
+    exit_code = 20
 
 # ======================================================================
 # Data model
@@ -2237,6 +2243,146 @@ def obtain_ssl_certificate(site_name: str, dry_run: bool = False) -> CertbotResu
             raise CertbotError(f"certbot reported success but {live_dir / file_name} does not exist.")
     log_success(f"Certbot finished: certificate files are in {live_dir}")
     return CertbotResult(fqdn, live_dir, False)
+
+# ======================================================================
+# SSL verification: Certbot's -le-ssl.conf and the certificate (Linux only, needs root)
+# ======================================================================
+@dataclass(frozen=True)
+class CertificateInfo:
+    issuer: str
+    not_after: str  # as printed by openssl, e.g. "Nov 17 12:51:40 2026 GMT"
+
+
+@dataclass(frozen=True)
+class SslCheckResult:
+    le_conf_path: Path
+    certificate: CertificateInfo
+
+
+def _openssl(args: List[str]) -> CommandResult:
+    try:
+        return run_command(["openssl", *args], timeout=30)
+    except CommandError as exc:
+        raise SslCheckError(f"openssl could not be run: {exc}") from exc
+
+
+def _parse_vhost_443(text: str) -> Optional[Dict[str, List[str]]]:
+    """Directives of the first <VirtualHost ...:443> block (names in lower case), None if there is none."""
+    match = re.search(r"<VirtualHost\s+[^>]*:443[^>]*>(.*?)</VirtualHost>", text, re.IGNORECASE | re.DOTALL)
+    if match is None:
+        return None
+    directives: Dict[str, List[str]] = {}
+    for line in match.group(1).splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "<")):
+            continue
+        parts = line.split(None, 1)
+        value = parts[1].strip().strip("\"'") if len(parts) > 1 else ""
+        directives.setdefault(parts[0].lower(), []).append(value)
+    return directives
+
+
+def check_le_ssl_config(site_name: str, document_root: Path) -> Path:
+    """
+    Check <site>.<zone>-le-ssl.conf made by Certbot: it exists, it is enabled, and its
+    <VirtualHost *:443> has the right ServerName, DocumentRoot and certificate files.
+    """
+    fqdn = build_site_fqdn(site_name)
+    live_dir = LETSENCRYPT_LIVE_DIR / fqdn
+    conf_path = APACHE_SITES_AVAILABLE_DIR / f"{fqdn}-le-ssl.conf"
+    if not conf_path.is_file():
+        raise SslCheckError(f"{conf_path} was not found: Certbot did not install the certificate into Apache.")
+    enabled_path = APACHE_SITES_ENABLED_DIR / conf_path.name
+    try:
+        enabled = os.path.lexists(enabled_path) and enabled_path.resolve() == conf_path.resolve()
+    except OSError:
+        enabled = False
+    if not enabled:
+        raise SslCheckError(f"{conf_path.name} is not enabled (no matching link in {APACHE_SITES_ENABLED_DIR}).")
+    try:
+        directives = _parse_vhost_443(conf_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise SslCheckError(f"{conf_path} can not be read: {exc}") from exc
+    if directives is None:
+        raise SslCheckError(f"{conf_path} has no <VirtualHost *:443> block.")
+    expected = {
+        "servername": fqdn,
+        "documentroot": str(document_root),
+        "sslcertificatefile": str(live_dir / "fullchain.pem"),
+        "sslcertificatekeyfile": str(live_dir / "privkey.pem"),
+    }
+    problems = [
+        f"{name} should be {value} (found: {', '.join(directives.get(name, [])) or 'nothing'})"
+        for name, value in expected.items()
+        if value not in directives.get(name, [])
+    ]
+    if problems:
+        raise SslCheckError(f"The port 443 virtual host in {conf_path.name} is not as expected: " + "; ".join(problems) + ".")
+    if not any("options-ssl-apache.conf" in value for value in directives.get("include", [])):
+        log_warning(f"{conf_path.name} does not include Certbot's options-ssl-apache.conf (the SSL hardening options).")
+    log_success(f"Apache SSL config {conf_path.name} is enabled and its port 443 virtual host is correct.")
+    return conf_path
+
+
+def check_certificate(site_name: str, ca_file: Optional[Path] = None) -> CertificateInfo:
+    """
+    Check the Let's Encrypt certificate in /etc/letsencrypt/live/<site>.<zone>/: Production issuer
+    (a Staging certificate is refused), valid for at least SSL_MIN_VALID_DAYS, matches the host name,
+    matches the private key, and its chain is trusted. ca_file is only for tests; normally the
+    system trust store is used.
+    """
+    fqdn = build_site_fqdn(site_name)
+    live_dir = LETSENCRYPT_LIVE_DIR / fqdn
+    fullchain, privkey = live_dir / "fullchain.pem", live_dir / "privkey.pem"
+    for path in (fullchain, privkey):
+        if not path.is_file():
+            raise SslCheckError(f"{path} does not exist.")
+
+    result = _openssl(["x509", "-in", str(fullchain), "-noout", "-issuer", "-enddate"])
+    issuer_match = re.search(r"^issuer\s*=\s*(.+)$", result.output, re.MULTILINE)
+    end_match = re.search(r"^notAfter\s*=\s*(.+)$", result.output, re.MULTILINE)
+    if result.returncode != 0 or issuer_match is None or end_match is None:
+        raise SslCheckError(f"{fullchain} is not a readable certificate: {_short(result.output)}")
+    issuer, not_after = issuer_match.group(1).strip(), end_match.group(1).strip()
+    if "staging" in issuer.lower():
+        raise SslCheckError(
+            f"The certificate is a Let's Encrypt STAGING (test) certificate (issuer: {issuer}); browsers and "
+            f"Arvan do not trust it. Remove it manually (certbot delete --cert-name {fqdn}) and request a Production one."
+        )
+    if not re.search(r"let.?s encrypt", issuer, re.IGNORECASE):
+        raise SslCheckError(f"The certificate was not issued by Let's Encrypt (issuer: {issuer}).")
+
+    result = _openssl(["x509", "-in", str(fullchain), "-noout", "-checkend", str(SSL_MIN_VALID_DAYS * 86400)])
+    if result.returncode != 0:
+        raise SslCheckError(
+            f"The certificate has expired or expires within {SSL_MIN_VALID_DAYS} days (valid until {not_after})."
+        )
+
+    result = _openssl(["x509", "-in", str(fullchain), "-noout", "-checkhost", fqdn])
+    if "does match certificate" not in result.output:
+        raise SslCheckError(f"The certificate is not valid for {fqdn}: {_short(result.output)}")
+
+    cert_key = _openssl(["x509", "-in", str(fullchain), "-noout", "-pubkey"])
+    private_key = _openssl(["pkey", "-in", str(privkey), "-pubout"])
+    if cert_key.returncode != 0 or private_key.returncode != 0 or cert_key.output != private_key.output:
+        raise SslCheckError(f"The private key {privkey} does not belong to the certificate {fullchain}.")
+
+    verify = ["verify", "-purpose", "sslserver"]
+    if ca_file is not None:
+        verify += ["-CAfile", str(ca_file)]
+    result = _openssl(verify + ["-untrusted", str(fullchain), str(fullchain)])
+    if result.returncode != 0:
+        raise SslCheckError(f"The certificate chain is not trusted: {_short(result.output)}")
+
+    log_success(f"Certificate for {fqdn}: Production Let's Encrypt, valid until {not_after}, matches the host and the key.")
+    return CertificateInfo(issuer, not_after)
+
+
+def verify_ssl_setup(site_name: str, document_root: Path, ca_file: Optional[Path] = None) -> SslCheckResult:
+    """Certbot's -le-ssl.conf (port 443 virtual host) and the certificate must both be correct."""
+    conf_path = check_le_ssl_config(site_name, document_root)
+    certificate = check_certificate(site_name, ca_file)
+    return SslCheckResult(conf_path, certificate)
 
 # ======================================================================
 # Cleanup
