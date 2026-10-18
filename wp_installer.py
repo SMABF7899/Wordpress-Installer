@@ -123,6 +123,10 @@ ARVAN_DNS_PAGE_SIZE = 50
 ARVAN_MAX_DNS_PAGES = 100
 DNS_POST_MAX_ATTEMPTS = 2  # at most one repeat, and only after the DNS state was re-checked
 DNS_RECHECK_DELAY_SECONDS = 3  # short pause before re-checking after an unclear POST
+ARVAN_UPSTREAM_PORT = 443  # origin port Arvan connects to once the cloud proxy is on
+ARVAN_UPDATE_MAX_ATTEMPTS = 2  # at most one repeat of a PUT, and only after the record was re-read
+ARVAN_CLOUD_WAIT_SECONDS = 300  # how long to wait until the site is served through Arvan Cloud
+ARVAN_CLOUD_POLL_INTERVAL_SECONDS = 10
 
 # ----------------------------------------------------------------------
 # Apache settings (Linux only)
@@ -2464,6 +2468,156 @@ def check_https_setup(site_name: str, via_origin: bool = True) -> HttpsCheckResu
     https_head = check_https_origin(site_name, via_origin=via_origin)
     redirect_head = check_https_redirect(site_name, via_origin=via_origin)
     return HttpsCheckResult(https_head.status, redirect_head.status, redirect_head.headers.get("location", ""))
+
+# ======================================================================
+# Arvan Cloud proxy: enable it and check the final answer (Linux only)
+# ======================================================================
+@dataclass(frozen=True)
+class ArvanCloudResult:
+    record_id: str
+    enabled_now: bool  # False: the record already had the cloud proxy on
+
+
+def arvan_get_dns_record(token: str, record_id: str) -> Dict[str, Any]:
+    """Read one DNS record (GET /dns-records/{id})."""
+    reply = arvan_request("GET", arvan_dns_records_path(record_id), token)
+    data = reply.get("data") if isinstance(reply, dict) else None
+    if not isinstance(data, dict):
+        raise ArvanApiError("Unexpected reply while reading the DNS record (no 'data' object).")
+    return data
+
+
+def _arvan_cloud_enabled(record: Dict[str, Any]) -> bool:
+    value = record.get("value")
+    ports_ok = (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(item, dict) and str(item.get("port")) == str(ARVAN_UPSTREAM_PORT) for item in value)
+    )
+    return record.get("cloud") is True and record.get("upstream_https") == "https" and ports_ok
+
+
+def build_cloud_enable_payload(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Body of the PUT that turns the Arvan cloud proxy on. Every writable field of the current record is
+    kept (type, name, value, ttl, ip_filter_mode); only cloud, upstream_https and the origin port change.
+    """
+    for key in ("type", "name", "value"):
+        if key not in record:
+            raise DnsRecordError(f"The DNS record has no '{key}' field; it was not modified.")
+    value = record["value"]
+    if not isinstance(value, list) or not value or not all(isinstance(item, dict) for item in value):
+        raise DnsRecordError("The DNS record has no usable 'value' list; it was not modified.")
+    ip_filter_mode = record.get("ip_filter_mode")
+    return {
+        "type": record["type"],
+        "name": record["name"],
+        "value": [{**item, "port": ARVAN_UPSTREAM_PORT} for item in value],
+        "ttl": record.get("ttl", DNS_RECORD_TTL),
+        "cloud": True,
+        "upstream_https": "https",
+        "ip_filter_mode": dict(ip_filter_mode) if isinstance(ip_filter_mode, dict)
+        else {"count": "single", "order": "none", "geo_filter": "none"},
+    }
+
+
+def enable_arvan_cloud(token: str, site_name: str, document_root: Path) -> ArvanCloudResult:
+    """
+    Turn the Arvan cloud proxy on for <site>.<zone> (cloud true, upstream_https https, origin port 443).
+    It refuses to do anything unless the certificate is a valid Production one (a Staging certificate
+    is refused) and Apache serves HTTPS correctly on the origin. A PUT with an unclear outcome is only
+    repeated (once) after the record was re-read. Nothing is rolled back on failure.
+    """
+    fqdn = build_site_fqdn(site_name)
+    verify_ssl_setup(site_name, document_root)
+    check_https_origin(site_name, via_origin=True)
+
+    exact = check_dns_state(token, site_name)
+    if exact is None or not exact.get("id"):
+        raise DnsRecordError(f"The A record of {fqdn} was not found in Arvan; the cloud proxy was not enabled.")
+    record_id = str(exact["id"])
+    try:
+        record = arvan_get_dns_record(token, record_id)
+    except ArvanApiError as exc:
+        raise DnsRecordError(f"Could not read the DNS record of {fqdn}: {exc}") from exc
+    if _arvan_cloud_enabled(record):
+        log_info(f"The Arvan cloud proxy is already enabled for {fqdn}.")
+        return ArvanCloudResult(record_id, enabled_now=False)
+
+    payload = build_cloud_enable_payload(record)
+    for attempt in range(1, ARVAN_UPDATE_MAX_ATTEMPTS + 1):
+        try:
+            arvan_request("PUT", arvan_dns_records_path(record_id), token, payload=payload)
+            break
+        except ArvanOutcomeUnknownError as exc:
+            log_warning(f"Enabling the Arvan cloud proxy (attempt {attempt}): {exc}")
+            time.sleep(DNS_RECHECK_DELAY_SECONDS)
+            try:
+                current = arvan_get_dns_record(token, record_id)
+            except ArvanApiError as check_exc:
+                raise DnsRecordError(
+                    f"The update outcome is unclear and the record could not be re-read ({check_exc}); "
+                    f"the request was not repeated. Check the record in the Arvan panel."
+                ) from check_exc
+            if _arvan_cloud_enabled(current):
+                log_success(f"Arvan cloud proxy enabled for {fqdn} (confirmed after an unclear reply).")
+                return ArvanCloudResult(record_id, enabled_now=True)
+            if attempt == ARVAN_UPDATE_MAX_ATTEMPTS:
+                raise DnsRecordError(
+                    f"Could not enable the Arvan cloud proxy for {fqdn}: the outcome stayed unclear and the "
+                    f"record does not show it. Check the record in the Arvan panel."
+                ) from exc
+            log_warning("The record does not show the change yet; repeating the update once.")
+        except ArvanApiError as exc:
+            raise DnsRecordError(f"Arvan rejected enabling the cloud proxy for {fqdn}: {exc}") from exc
+
+    try:
+        current = arvan_get_dns_record(token, record_id)
+    except ArvanApiError as exc:
+        raise DnsRecordError(f"The update was accepted but the record could not be re-read: {exc}") from exc
+    if not _arvan_cloud_enabled(current):
+        raise DnsRecordError(
+            f"Arvan accepted the update but the record of {fqdn} does not show the cloud proxy as enabled "
+            f"(cloud/upstream_https/port). Check the record in the Arvan panel."
+        )
+    log_success(f"Arvan cloud proxy enabled for {fqdn} (upstream https, origin port {ARVAN_UPSTREAM_PORT}).")
+    return ArvanCloudResult(record_id, enabled_now=True)
+
+
+def check_arvan_cloud_response(site_name: str) -> HttpHeadResult:
+    """
+    The final check: 'curl -I https://<site>' through the public DNS (certificate verification stays on)
+    must answer 2xx/3xx with the header 'Server: ArvanCloud'. Waits while the change propagates.
+    """
+    fqdn = build_site_fqdn(site_name)
+    url = f"https://{fqdn}"
+    log_info(f"Waiting for {url} to be served through Arvan Cloud (up to {ARVAN_CLOUD_WAIT_SECONDS} seconds)...")
+    deadline = time.monotonic() + ARVAN_CLOUD_WAIT_SECONDS
+    last = "no answer yet"
+    while True:
+        try:
+            head = curl_head(url)
+        except SiteCheckError as exc:
+            last = str(exc).splitlines()[0]
+        else:
+            server = head.headers.get("server", "")
+            if "arvancloud" in server.lower():
+                if 200 <= head.status < 400:
+                    log_success(f"Arvan Cloud: {url} answered {head.status} {head.reason} (Server: {server}).")
+                    return head
+                last = f"Arvan answered HTTP {head.status} {head.reason}".rstrip()
+                last += (": it can not get a good answer from the origin (check origin port 443 and the SSL mode)"
+                         if head.status >= 500 else "; a 2xx or 3xx answer was expected")
+            else:
+                last = f"HTTP {head.status} with Server: {server or 'none'}, not served by Arvan yet (DNS may still be changing)"
+        if time.monotonic() >= deadline:
+            break
+        log_debug(f"Arvan check: {last}")
+        time.sleep(ARVAN_CLOUD_POLL_INTERVAL_SECONDS)
+    raise SiteCheckError(
+        f"{url} is not served through Arvan Cloud after {ARVAN_CLOUD_WAIT_SECONDS} seconds. Last result: {last}. "
+        f"The cloud proxy was left enabled (nothing was rolled back); check the record and its SSL settings in the Arvan panel."
+    )
 
 # ======================================================================
 # Cleanup
