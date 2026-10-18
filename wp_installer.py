@@ -148,7 +148,7 @@ APACHE_VHOST_TEMPLATE = """\
 # ----------------------------------------------------------------------
 # Site reachability checks (DNS, ping, HTTP)
 # ----------------------------------------------------------------------
-DNS_WAIT_SECONDS = 120  # how long to wait for the new name to resolve (DNS propagation / cached answers)
+DNS_WAIT_SECONDS = 300  # how long to wait for the new name to resolve (DNS propagation / cached answers)
 DNS_POLL_INTERVAL_SECONDS = 5
 PING_COUNT = 3
 PING_WAIT_SECONDS = 2  # per-packet wait of ping -W
@@ -1964,34 +1964,85 @@ def resolve_ipv4(fqdn: str) -> List[str]:
     return sorted({str(info[4][0]) for info in infos})
 
 
+_IPV4_RE = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
+
+
+def dig_ipv4(fqdn: str, server: Optional[str] = None) -> List[str]:
+    """IPv4 answers of 'dig +short A <fqdn> [@server]'; an empty list means no answer."""
+    command = ["dig", "+short", "+time=3", "+tries=1", "A", fqdn]
+    if server:
+        command.append(f"@{server}")
+    result = run_command(command, timeout=20)
+    return sorted({line.strip() for line in result.output.splitlines() if _IPV4_RE.fullmatch(line.strip())})
+
+
+def get_zone_nameservers() -> List[str]:
+    """Name servers of the zone (from 'dig +short NS'); an empty list if they can not be read."""
+    result = run_command(["dig", "+short", "+time=3", "+tries=2", "NS", DNS_ZONE], timeout=30)
+    names = {line.strip().rstrip(".").lower() for line in result.output.splitlines()}
+    return sorted(name for name in names if re.fullmatch(r"[a-z0-9][a-z0-9.-]*[a-z0-9]", name))
+
+
 def check_dns_resolution(site_name: str, expect_origin: bool = True) -> List[str]:
     """
-    Wait until <site>.<zone> resolves. With expect_origin (Arvan cloud proxy still off) the answer
-    must contain SERVER_IP; pass expect_origin=False when the record already has the cloud proxy on,
+    Wait until <site>.<zone> is published. The zone's own (authoritative) name servers are asked
+    directly with dig, so an old answer cached by this server's resolver can not hide a new record;
+    without dig the system resolver is used. With expect_origin (Arvan cloud proxy still off) every
+    answer must contain SERVER_IP; pass expect_origin=False when the cloud proxy is already on,
     because Arvan then answers with its own addresses.
     """
     fqdn = build_site_fqdn(site_name)
-    log_info(f"Checking DNS for {fqdn} (waiting up to {DNS_WAIT_SECONDS} seconds for it to resolve)...")
+    nameservers: List[str] = []
+    if shutil.which("dig"):
+        try:
+            nameservers = get_zone_nameservers()
+        except CommandError as exc:
+            log_warning(f"Could not read the name servers of {DNS_ZONE}: {exc}")
+    if nameservers:
+        log_info(
+            f"Checking DNS for {fqdn} on the name servers {', '.join(nameservers)} "
+            f"(waiting up to {DNS_WAIT_SECONDS} seconds)..."
+        )
+    else:
+        log_warning("dig or the name servers are not available: using this server's resolver, which may cache a negative answer.")
+        log_info(f"Checking DNS for {fqdn} (waiting up to {DNS_WAIT_SECONDS} seconds)...")
+
+    def acceptable(ips: List[str]) -> bool:
+        return bool(ips) and (not expect_origin or SERVER_IP in ips)
+
     deadline = time.monotonic() + DNS_WAIT_SECONDS
-    ips: List[str] = []
     while True:
-        ips = resolve_ipv4(fqdn)
-        if ips and (not expect_origin or SERVER_IP in ips):
-            log_success(f"DNS: {fqdn} resolves to {', '.join(ips)}")
-            return ips
+        try:
+            if nameservers:
+                answers = {server: dig_ipv4(fqdn, server) for server in nameservers}
+            else:
+                answers = {"this server's resolver": resolve_ipv4(fqdn)}
+        except CommandError as exc:
+            raise SiteCheckError(f"DNS query for {fqdn} failed: {exc}") from exc
+        if all(acceptable(ips) for ips in answers.values()):
+            all_ips = sorted({ip for ips in answers.values() for ip in ips})
+            where = "all name servers" if nameservers else "this server's resolver"
+            log_success(f"DNS: {fqdn} resolves to {', '.join(all_ips)} ({where})")
+            if nameservers and not acceptable(resolve_ipv4(fqdn)):
+                log_warning(
+                    "This server's own resolver does not see the record yet (it may have cached 'no such name'). "
+                    "This is not an error: Let's Encrypt asks the name servers directly and the HTTP check bypasses it."
+                )
+            return all_ips
         if time.monotonic() >= deadline:
             break
-        log_debug(f"DNS: {fqdn} -> {', '.join(ips) if ips else 'no answer'}; retrying")
+        log_debug("DNS: " + "; ".join(f"{who}: {', '.join(ips) or 'no answer'}" for who, ips in answers.items()))
         time.sleep(DNS_POLL_INTERVAL_SECONDS)
-    if not ips:
+    state = "; ".join(f"{who}: {', '.join(ips) or 'no answer'}" for who, ips in answers.items())
+    if not any(answers.values()):
         raise SiteCheckError(
-            f"{fqdn} does not resolve after {DNS_WAIT_SECONDS} seconds. If the record was only just created, "
-            f"this is usually DNS propagation or a cached negative answer on this server; otherwise check that "
-            f"the record exists in Arvan and that smabf.ir uses Arvan's name servers."
+            f"{fqdn} is not published after {DNS_WAIT_SECONDS} seconds ({state}). If the record was only just "
+            f"created, wait and retry; otherwise check that the record exists in Arvan and that {DNS_ZONE} "
+            f"uses Arvan's name servers."
         )
     raise SiteCheckError(
-        f"{fqdn} resolves to {', '.join(ips)} but the origin IP {SERVER_IP} was expected "
-        f"(if the Arvan cloud proxy is already on for this record, the addresses differ by design)."
+        f"{fqdn} did not reach the expected state after {DNS_WAIT_SECONDS} seconds ({state}). Expected: "
+        f"{SERVER_IP} (if the Arvan cloud proxy is already on for this record, the addresses differ by design)."
     )
 
 
@@ -2032,28 +2083,39 @@ def parse_http_head(text: str) -> HttpHeadResult:
     return HttpHeadResult(int(match.group(1)), match.group(2).strip(), headers)
 
 
-def curl_head(url: str) -> HttpHeadResult:
-    """'curl -I <url>': redirects are not followed and TLS verification is never disabled."""
+def curl_head(url: str, resolve: Optional[str] = None) -> HttpHeadResult:
+    """
+    'curl -I <url>': redirects are not followed and TLS verification is never disabled.
+    resolve ('host:port:ip') makes curl connect to that IP without asking any DNS resolver.
+    """
     command = [
         "curl", "-I", "-sS",
         "--connect-timeout", "10",
         "--max-time", str(HTTP_REQUEST_TIMEOUT_SECONDS),
         "--proto", "=http,https",
-        url,
     ]
+    if resolve:
+        command += ["--resolve", resolve]
+    command.append(url)
     result = run_command(command, timeout=HTTP_REQUEST_TIMEOUT_SECONDS + 10)
     if result.returncode != 0:
         raise SiteCheckError(f"curl -I {url} failed (exit code {result.returncode}): {_short(result.output)}")
     return parse_http_head(result.output)
 
 
-def check_http_access(site_name: str) -> HttpHeadResult:
-    """HEAD request to http://<site>: any 2xx/3xx answer is fine (a fresh WordPress redirects to its installer)."""
-    url = f"http://{build_site_fqdn(site_name)}"
+def check_http_access(site_name: str, via_origin: bool = True) -> HttpHeadResult:
+    """
+    HEAD request to http://<site>: any 2xx/3xx answer is fine (a fresh WordPress redirects to its installer).
+    via_origin: connect straight to SERVER_IP (needs no DNS, so a cached 'no such name' can not interfere);
+    use via_origin=False once the Arvan cloud proxy is on and the request must go through the public DNS.
+    """
+    fqdn = build_site_fqdn(site_name)
+    url = f"http://{fqdn}"
+    resolve = f"{fqdn}:80:{SERVER_IP}" if via_origin else None
     head: Optional[HttpHeadResult] = None
     for attempt in range(1, HTTP_CHECK_ATTEMPTS + 1):
         try:
-            head = curl_head(url)
+            head = curl_head(url, resolve)
             break
         except SiteCheckError as exc:
             if attempt == HTTP_CHECK_ATTEMPTS:
@@ -2067,7 +2129,8 @@ def check_http_access(site_name: str) -> HttpHeadResult:
             f"Check the Apache vhost, the DocumentRoot and its permissions."
         )
     location = f" -> {head.headers['location']}" if "location" in head.headers else ""
-    log_success(f"HTTP: {url} answered {head.status} {head.reason}{location}")
+    via = f" (straight from {SERVER_IP})" if via_origin else ""
+    log_success(f"HTTP: {url}{via} answered {head.status} {head.reason}{location}")
     return head
 
 
@@ -2075,7 +2138,7 @@ def check_site_reachability(site_name: str, expect_origin: bool = True) -> SiteC
     """DNS (must pass), ping (warning only) and HTTP (must pass). A failed ping alone is not a failure."""
     dns_ips = check_dns_resolution(site_name, expect_origin=expect_origin)
     ping_ok = check_ping(site_name)
-    head = check_http_access(site_name)
+    head = check_http_access(site_name, via_origin=expect_origin)
     return SiteCheckResult(dns_ips, ping_ok, head.status)
 
 # ======================================================================
