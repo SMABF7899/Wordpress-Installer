@@ -2394,9 +2394,11 @@ class HttpsCheckResult:
     redirect_location: str
 
 
-# (text in the curl error, hint for the user)
+# (text in the first line of the curl error, hint for the user); the first match wins
 _HTTPS_CURL_HINTS = [
-    ("exit code 60", "The certificate served by Apache is not trusted (a Staging certificate, or this server lacks its CA bundle)."),
+    ("subject name", "Apache served a certificate for a different name: the port 443 virtual host of this site is missing or not used."),
+    ("has expired", "The certificate served by Apache has expired."),
+    ("exit code 60", "The certificate served by Apache is not trusted (a Staging or self-signed certificate, or this server lacks its CA bundle)."),
     ("exit code 7", "Nothing accepts connections on port 443: check that Certbot enabled mod_ssl and that Apache was reloaded."),
     ("exit code 35", "The TLS handshake failed: check the port 443 virtual host and its certificate files."),
 ]
@@ -2426,8 +2428,9 @@ def check_https_origin(site_name: str, via_origin: bool = True) -> HttpHeadResul
     try:
         head = _head_with_retries(url, resolve)
     except SiteCheckError as exc:
-        hints = [hint for needle, hint in _HTTPS_CURL_HINTS if needle in str(exc)]
-        raise SiteCheckError(f"{exc} {hints[0]}" if hints else str(exc)) from exc
+        text = str(exc).splitlines()[0]  # curl adds a long generic explanation after its first line
+        hints = [hint for needle, hint in _HTTPS_CURL_HINTS if needle in text]
+        raise SiteCheckError(f"{text} {hints[0]}" if hints else text) from exc
     if not 200 <= head.status < 400:
         raise SiteCheckError(
             f"{url} answered HTTP {head.status} {head.reason}; a 2xx or 3xx answer was expected. "
