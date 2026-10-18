@@ -2385,6 +2385,84 @@ def verify_ssl_setup(site_name: str, document_root: Path, ca_file: Optional[Path
     return SslCheckResult(conf_path, certificate)
 
 # ======================================================================
+# HTTPS on the origin server and the HTTP -> HTTPS redirect (Linux only)
+# ======================================================================
+@dataclass(frozen=True)
+class HttpsCheckResult:
+    https_status: int
+    redirect_status: int
+    redirect_location: str
+
+
+# (text in the curl error, hint for the user)
+_HTTPS_CURL_HINTS = [
+    ("exit code 60", "The certificate served by Apache is not trusted (a Staging certificate, or this server lacks its CA bundle)."),
+    ("exit code 7", "Nothing accepts connections on port 443: check that Certbot enabled mod_ssl and that Apache was reloaded."),
+    ("exit code 35", "The TLS handshake failed: check the port 443 virtual host and its certificate files."),
+]
+
+
+def _head_with_retries(url: str, resolve: Optional[str]) -> HttpHeadResult:
+    """curl -I with a few repeats when curl itself fails; a certificate problem (exit code 60) is not repeated."""
+    for attempt in range(1, HTTP_CHECK_ATTEMPTS + 1):
+        try:
+            return curl_head(url, resolve)
+        except SiteCheckError as exc:
+            if attempt == HTTP_CHECK_ATTEMPTS or "exit code 60" in str(exc):
+                raise
+            log_warning(f"Check of {url}, attempt {attempt}/{HTTP_CHECK_ATTEMPTS} failed: {exc}")
+            time.sleep(HTTP_CHECK_INTERVAL_SECONDS)
+    raise SiteCheckError(f"Check of {url} failed.")  # not reachable
+
+
+def check_https_origin(site_name: str, via_origin: bool = True) -> HttpHeadResult:
+    """
+    HEAD request to https://<site> with full certificate verification (never disabled). via_origin connects
+    straight to SERVER_IP, so this proves that Apache itself serves a trusted certificate on port 443.
+    """
+    fqdn = build_site_fqdn(site_name)
+    url = f"https://{fqdn}"
+    resolve = f"{fqdn}:443:{SERVER_IP}" if via_origin else None
+    try:
+        head = _head_with_retries(url, resolve)
+    except SiteCheckError as exc:
+        hints = [hint for needle, hint in _HTTPS_CURL_HINTS if needle in str(exc)]
+        raise SiteCheckError(f"{exc} {hints[0]}" if hints else str(exc)) from exc
+    if not 200 <= head.status < 400:
+        raise SiteCheckError(
+            f"{url} answered HTTP {head.status} {head.reason}; a 2xx or 3xx answer was expected. "
+            f"Check the port 443 virtual host and the DocumentRoot."
+        )
+    via = f" (straight from {SERVER_IP})" if via_origin else ""
+    log_success(f"HTTPS: {url}{via} answered {head.status} {head.reason} with a trusted certificate.")
+    return head
+
+
+def check_https_redirect(site_name: str, via_origin: bool = True) -> HttpHeadResult:
+    """http://<site>/ must answer with a redirect (301, 302, 307 or 308) to https://<site>/..."""
+    fqdn = build_site_fqdn(site_name)
+    url = f"http://{fqdn}/"
+    resolve = f"{fqdn}:80:{SERVER_IP}" if via_origin else None
+    head = _head_with_retries(url, resolve)
+    location = head.headers.get("location", "")
+    parsed = urllib.parse.urlsplit(location)
+    if head.status not in (301, 302, 307, 308) or parsed.scheme.lower() != "https" or (parsed.hostname or "").lower() != fqdn:
+        raise SiteCheckError(
+            f"{url} does not redirect to https://{fqdn}/ (answered HTTP {head.status} {head.reason}, "
+            f"Location: {location or 'none'}). Certbot's --redirect should have added the rewrite rule to "
+            f"{fqdn}.conf; check that file."
+        )
+    log_success(f"Redirect: {url} -> {location} (HTTP {head.status})")
+    return head
+
+
+def check_https_setup(site_name: str, via_origin: bool = True) -> HttpsCheckResult:
+    """HTTPS must work with a trusted certificate and plain HTTP must redirect to it."""
+    https_head = check_https_origin(site_name, via_origin=via_origin)
+    redirect_head = check_https_redirect(site_name, via_origin=via_origin)
+    return HttpsCheckResult(https_head.status, redirect_head.status, redirect_head.headers.get("location", ""))
+
+# ======================================================================
 # Cleanup
 # ======================================================================
 def cleanup_temp_dir(temp_dir: Optional[Path]) -> None:
