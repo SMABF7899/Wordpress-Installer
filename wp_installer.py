@@ -146,6 +146,17 @@ APACHE_VHOST_TEMPLATE = """\
 """
 
 # ----------------------------------------------------------------------
+# Site reachability checks (DNS, ping, HTTP)
+# ----------------------------------------------------------------------
+DNS_WAIT_SECONDS = 120  # how long to wait for the new name to resolve (DNS propagation / cached answers)
+DNS_POLL_INTERVAL_SECONDS = 5
+PING_COUNT = 3
+PING_WAIT_SECONDS = 2  # per-packet wait of ping -W
+HTTP_REQUEST_TIMEOUT_SECONDS = 20
+HTTP_CHECK_ATTEMPTS = 3  # only repeated when curl itself failed (e.g. connection refused right after a reload)
+HTTP_CHECK_INTERVAL_SECONDS = 3
+
+# ----------------------------------------------------------------------
 # Limits and technical constants
 # ----------------------------------------------------------------------
 HTTP_TIMEOUT_SECONDS = 30
@@ -507,6 +518,11 @@ class CommandError(InstallerError):
     """An external command could not be started or did not finish in time."""
 
     exit_code = 17
+
+class SiteCheckError(InstallerError):
+    """A DNS or HTTP check of the new site failed."""
+
+    exit_code = 18
 
 # ======================================================================
 # Data model
@@ -1909,6 +1925,145 @@ def activate_apache_site(conf_path: Path) -> bool:
         ) from exc
     reload_apache()
     return enabled_now
+
+# ======================================================================
+# Site reachability checks: DNS, ping, HTTP (Linux only)
+# ======================================================================
+@dataclass(frozen=True)
+class HttpHeadResult:
+    status: int
+    reason: str
+    headers: Dict[str, str]  # header names in lower case (a repeated header keeps its last value)
+
+
+@dataclass(frozen=True)
+class SiteCheckResult:
+    dns_ips: List[str]
+    ping_ok: Optional[bool]  # None: the ping command is not available
+    http_status: int
+
+
+def resolve_ipv4(fqdn: str) -> List[str]:
+    """IPv4 addresses of a name as seen by this server's resolver (empty list if it does not resolve)."""
+    try:
+        infos = socket.getaddrinfo(fqdn, 80, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+    return sorted({str(info[4][0]) for info in infos})
+
+
+def check_dns_resolution(site_name: str, expect_origin: bool = True) -> List[str]:
+    """
+    Wait until <site>.<zone> resolves. With expect_origin (Arvan cloud proxy still off) the answer
+    must contain SERVER_IP; pass expect_origin=False when the record already has the cloud proxy on,
+    because Arvan then answers with its own addresses.
+    """
+    fqdn = build_site_fqdn(site_name)
+    log_info(f"Checking DNS for {fqdn} (waiting up to {DNS_WAIT_SECONDS} seconds for it to resolve)...")
+    deadline = time.monotonic() + DNS_WAIT_SECONDS
+    ips: List[str] = []
+    while True:
+        ips = resolve_ipv4(fqdn)
+        if ips and (not expect_origin or SERVER_IP in ips):
+            log_success(f"DNS: {fqdn} resolves to {', '.join(ips)}")
+            return ips
+        if time.monotonic() >= deadline:
+            break
+        log_debug(f"DNS: {fqdn} -> {', '.join(ips) if ips else 'no answer'}; retrying")
+        time.sleep(DNS_POLL_INTERVAL_SECONDS)
+    if not ips:
+        raise SiteCheckError(
+            f"{fqdn} does not resolve after {DNS_WAIT_SECONDS} seconds. The record exists in Arvan, so this is "
+            f"usually DNS propagation or a cached negative answer on this server; wait a few minutes and retry."
+        )
+    raise SiteCheckError(
+        f"{fqdn} resolves to {', '.join(ips)} but the origin IP {SERVER_IP} was expected "
+        f"(if the Arvan cloud proxy is already on for this record, the addresses differ by design)."
+    )
+
+
+def check_ping(site_name: str) -> Optional[bool]:
+    """Ping the site. A failure is only a warning: many servers and firewalls drop ICMP."""
+    fqdn = build_site_fqdn(site_name)
+    command = ["ping", "-c", str(PING_COUNT), "-W", str(PING_WAIT_SECONDS), fqdn]
+    try:
+        result = run_command(command, timeout=PING_COUNT * (PING_WAIT_SECONDS + 1) + 10)
+    except CommandError as exc:
+        log_warning(f"Ping skipped: {exc}")
+        return None
+    if result.returncode == 0:
+        log_success(f"Ping to {fqdn} succeeded.")
+        return True
+    log_warning(f"Ping to {fqdn} failed. This alone is not an error: many servers and firewalls drop ICMP.")
+    return False
+
+
+def parse_http_head(text: str) -> HttpHeadResult:
+    """Parse the output of 'curl -I' (the last response header block is used)."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    starts = [i for i, line in enumerate(lines) if re.match(r"HTTP/\S+\s+\d{3}", line, re.IGNORECASE)]
+    if not starts:
+        raise SiteCheckError(f"No HTTP response headers received: {_short(text, 300)}")
+    block: List[str] = []
+    for line in lines[starts[-1]:]:
+        if not line.strip():
+            break
+        block.append(line)
+    match = re.match(r"HTTP/\S+\s+(\d{3})\s*(.*)", block[0].strip(), re.IGNORECASE)
+    assert match is not None  # guaranteed by the search above
+    headers: Dict[str, str] = {}
+    for line in block[1:]:
+        name, separator, value = line.partition(":")
+        if separator:
+            headers[name.strip().lower()] = value.strip()
+    return HttpHeadResult(int(match.group(1)), match.group(2).strip(), headers)
+
+
+def curl_head(url: str) -> HttpHeadResult:
+    """'curl -I <url>': redirects are not followed and TLS verification is never disabled."""
+    command = [
+        "curl", "-I", "-sS",
+        "--connect-timeout", "10",
+        "--max-time", str(HTTP_REQUEST_TIMEOUT_SECONDS),
+        "--proto", "=http,https",
+        url,
+    ]
+    result = run_command(command, timeout=HTTP_REQUEST_TIMEOUT_SECONDS + 10)
+    if result.returncode != 0:
+        raise SiteCheckError(f"curl -I {url} failed (exit code {result.returncode}): {_short(result.output)}")
+    return parse_http_head(result.output)
+
+
+def check_http_access(site_name: str) -> HttpHeadResult:
+    """HEAD request to http://<site>: any 2xx/3xx answer is fine (a fresh WordPress redirects to its installer)."""
+    url = f"http://{build_site_fqdn(site_name)}"
+    head: Optional[HttpHeadResult] = None
+    for attempt in range(1, HTTP_CHECK_ATTEMPTS + 1):
+        try:
+            head = curl_head(url)
+            break
+        except SiteCheckError as exc:
+            if attempt == HTTP_CHECK_ATTEMPTS:
+                raise
+            log_warning(f"HTTP check attempt {attempt}/{HTTP_CHECK_ATTEMPTS} failed: {exc}")
+            time.sleep(HTTP_CHECK_INTERVAL_SECONDS)
+    assert head is not None
+    if not 200 <= head.status < 400:
+        raise SiteCheckError(
+            f"{url} answered HTTP {head.status} {head.reason}; a 2xx or 3xx answer was expected. "
+            f"Check the Apache vhost, the DocumentRoot and its permissions."
+        )
+    location = f" -> {head.headers['location']}" if "location" in head.headers else ""
+    log_success(f"HTTP: {url} answered {head.status} {head.reason}{location}")
+    return head
+
+
+def check_site_reachability(site_name: str, expect_origin: bool = True) -> SiteCheckResult:
+    """DNS (must pass), ping (warning only) and HTTP (must pass). A failed ping alone is not a failure."""
+    dns_ips = check_dns_resolution(site_name, expect_origin=expect_origin)
+    ping_ok = check_ping(site_name)
+    head = check_http_access(site_name)
+    return SiteCheckResult(dns_ips, ping_ok, head.status)
 
 # ======================================================================
 # Cleanup
