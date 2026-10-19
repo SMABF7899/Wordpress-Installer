@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -13,6 +14,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
 
 BASE_DOMAIN = "smabf.ir"
@@ -35,6 +39,13 @@ DB_PORT = 3306
 DB_CONNECT_TIMEOUT_SECONDS = 10
 DB_OPERATION_TIMEOUT_SECONDS = 30
 DB_DRIVER_PIP_NAME = "PyMySQL"
+
+ARVAN_API_BASE_URL = "https://napi.arvancloud.ir/cdn/4.0"
+ARVAN_TOKEN_ENV_VAR = "ARVAN_API_TOKEN"
+ARVAN_REQUEST_TIMEOUT_SECONDS = 30
+ARVAN_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+ARVAN_DNS_PAGE_SIZE = 300
+ARVAN_MAX_DNS_PAGES = 100
 
 
 class Log:
@@ -78,6 +89,12 @@ LOG = Log()
 
 class UninstallError(RuntimeError):
     pass
+
+
+class ArvanAPIError(UninstallError):
+    def __init__(self, message: str, *, outcome_uncertain: bool = False) -> None:
+        super().__init__(message)
+        self.outcome_uncertain = outcome_uncertain
 
 
 def run_command(
@@ -222,6 +239,267 @@ def show_plan(paths: dict[str, object]) -> None:
     LOG.info("Remove only the two matching Apache configuration files.")
     LOG.info(f"Remove only the site directory {paths['site_dir']}.")
     LOG.info(f"Drop only the MySQL database {paths['database']}.")
+    LOG.info("Delete the exact matching Arvan Cloud A record as the final operation.")
+
+
+def get_arvan_api_token() -> str:
+    token = os.environ.get(ARVAN_TOKEN_ENV_VAR, "").strip()
+    if not token:
+        raise UninstallError(
+            f"Arvan Cloud API token is missing. Set the {ARVAN_TOKEN_ENV_VAR} environment variable."
+        )
+    if not token or any(not 33 <= ord(character) <= 126 for character in token):
+        raise UninstallError(f"{ARVAN_TOKEN_ENV_VAR} contains invalid characters for an API header.")
+    return token
+
+
+def arvan_api_request(method: str, url: str, token: str) -> tuple[int, bytes]:
+    request = Request(
+        url,
+        headers={
+            "Authorization": f"Apikey {token}",
+            "Accept": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=ARVAN_REQUEST_TIMEOUT_SECONDS) as response:
+            status = response.status
+            body = response.read(ARVAN_MAX_RESPONSE_BYTES + 1)
+    except HTTPError as exc:
+        if exc.code == 401:
+            raise ArvanAPIError("Arvan Cloud authentication failed (HTTP 401). Check the API token.") from None
+        if exc.code == 403:
+            raise ArvanAPIError("Arvan Cloud denied the API request (HTTP 403). Check token permissions.") from None
+        raise ArvanAPIError(
+            f"Arvan Cloud API returned HTTP {exc.code} for {method}.",
+            outcome_uncertain=(method == "DELETE"),
+        ) from None
+    except (URLError, TimeoutError, OSError) as exc:
+        if method == "DELETE":
+            raise ArvanAPIError(
+                "The Arvan Cloud DELETE request did not return a definite result.",
+                outcome_uncertain=True,
+            ) from None
+        reason = getattr(exc, "reason", exc)
+        raise ArvanAPIError(f"Arvan Cloud {method} request failed: {reason}.") from None
+    if len(body) > ARVAN_MAX_RESPONSE_BYTES:
+        raise ArvanAPIError(
+            f"Arvan Cloud response exceeded {ARVAN_MAX_RESPONSE_BYTES} bytes.",
+            outcome_uncertain=(method == "DELETE"),
+        )
+    if not 200 <= status < 300:
+        raise ArvanAPIError(
+            f"Arvan Cloud API returned unexpected HTTP {status} for {method}.",
+            outcome_uncertain=(method == "DELETE"),
+        )
+    return status, body
+
+
+def fetch_arvan_dns_records(token: str) -> list[dict[str, Any]]:
+    endpoint = f"{ARVAN_API_BASE_URL}/domains/{quote(BASE_DOMAIN, safe='')}/dns-records"
+    all_records: list[dict[str, Any]] = []
+    last_page: Optional[int] = None
+
+    for page in range(1, ARVAN_MAX_DNS_PAGES + 1):
+        query = urlencode({"page": page, "per_page": ARVAN_DNS_PAGE_SIZE})
+        _, body = arvan_api_request("GET", f"{endpoint}?{query}", token)
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise UninstallError(f"Arvan Cloud returned invalid JSON: {exc}") from None
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise UninstallError("Arvan Cloud returned an invalid DNS records response (expected a data list).")
+        records = payload["data"]
+        if any(not isinstance(record, dict) for record in records):
+            raise UninstallError("Arvan Cloud returned an invalid DNS records response (record is not an object).")
+        all_records.extend(records)
+
+        metadata = payload.get("meta")
+        if metadata is None:
+            if len(records) >= ARVAN_DNS_PAGE_SIZE:
+                raise UninstallError("Arvan Cloud response may be paginated but contains no pagination metadata.")
+            return all_records
+        if not isinstance(metadata, dict):
+            raise UninstallError("Arvan Cloud returned invalid pagination metadata.")
+        last_page = metadata.get("last_page")
+        if type(last_page) is not int or last_page < 0:
+            raise UninstallError("Arvan Cloud returned invalid pagination metadata (last_page).")
+        if last_page == 0 or page >= last_page:
+            return all_records
+        if last_page > ARVAN_MAX_DNS_PAGES:
+            raise UninstallError(
+                f"Arvan Cloud DNS list has too many pages to inspect safely ({last_page})."
+            )
+
+    raise UninstallError(
+        f"Arvan Cloud DNS listing exceeded the {ARVAN_MAX_DNS_PAGES}-page safety limit."
+    )
+
+
+def matching_arvan_a_records(records: list[dict[str, Any]], site_name: str) -> list[dict[str, Any]]:
+    return [
+        record
+        for record in records
+        if record.get("name") == site_name
+        and isinstance(record.get("type"), str)
+        and record["type"].upper() == "A"
+    ]
+
+
+def arvan_record_ip(record: dict[str, Any]) -> Optional[str]:
+    value = record.get("value")
+    if isinstance(value, dict):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    elif isinstance(value, str) and value.strip():
+        return value.strip()
+    else:
+        return None
+
+    ips: list[str] = []
+    for item in values:
+        if not isinstance(item, dict) or not isinstance(item.get("ip"), str) or not item["ip"].strip():
+            return None
+        ips.append(item["ip"].strip())
+    return ", ".join(ips) if ips else None
+
+
+def show_arvan_record(record: dict[str, Any]) -> None:
+    record_id = record.get("id", "<missing>")
+    name = record.get("name", "<missing>")
+    record_type = record.get("type", "<missing>")
+    ip = arvan_record_ip(record) or "<unavailable>"
+    LOG.info(f"DNS record: name={name}, type={record_type}, IP={ip}, id={record_id}")
+
+
+def validate_arvan_record_id(record: dict[str, Any]) -> str:
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", record_id):
+        raise UninstallError("Arvan Cloud returned a DNS record with an invalid or missing record ID.")
+    return record_id
+
+
+def ensure_prior_stages_succeeded(stages: dict[str, str]) -> None:
+    incomplete = [
+        f"{label}={state}"
+        for label, state in stages.items()
+        if label != "Delete Arvan Cloud DNS record"
+        and (state == "in progress" or state.startswith(("not run", "FAILED", "cancelled")))
+    ]
+    if incomplete:
+        raise UninstallError(
+            "Arvan Cloud DNS deletion is blocked because earlier uninstall stages did not complete: "
+            + "; ".join(incomplete)
+        )
+
+
+def arvan_record_id_is_present(token: str, record_id: str) -> bool:
+    records = fetch_arvan_dns_records(token)
+    return any(record.get("id") == record_id for record in records)
+
+
+def delete_arvan_dns_record(
+    site_name: str,
+    token: str,
+    stages: dict[str, str],
+    *,
+    dry_run: bool,
+) -> None:
+    label = "Delete Arvan Cloud DNS record"
+    stages[label] = "in progress"
+    if not dry_run:
+        ensure_prior_stages_succeeded(stages)
+
+    matches = matching_arvan_a_records(fetch_arvan_dns_records(token), site_name)
+    if not matches:
+        stages[label] = "skipped (no exact matching A record found)"
+        LOG.warn(f"No exact A record named {site_name} was found in {BASE_DOMAIN}.")
+        return
+    if len(matches) > 1:
+        for record in matches:
+            show_arvan_record(record)
+        stages[label] = "FAILED (multiple exact A records; none deleted)"
+        raise UninstallError(
+            f"Found {len(matches)} A records named exactly {site_name}; none were deleted. Resolve the ambiguity first."
+        )
+
+    record = matches[0]
+    show_arvan_record(record)
+    record_id = validate_arvan_record_id(record)
+    selected_ip = arvan_record_ip(record)
+    if not selected_ip:
+        raise UninstallError("The matching A record has no valid IP value; refusing to delete it.")
+    if record.get("is_protected") is True or record.get("can_delete") is False:
+        raise UninstallError("The matching Arvan Cloud DNS record is protected and cannot be deleted safely.")
+
+    if dry_run:
+        stages[label] = "would delete (dry-run; no DELETE request sent)"
+        LOG.info("Dry run: this exact A record is the only matching candidate; no DNS changes were made.")
+        return
+
+    confirmation = f"DELETE {site_name}.{BASE_DOMAIN}"
+    LOG.warn(f"Type exactly '{confirmation}' to delete this DNS record:")
+    try:
+        typed_confirmation = input("Confirm DNS deletion: ").strip()
+    except EOFError:
+        typed_confirmation = ""
+    if typed_confirmation != confirmation:
+        stages[label] = "cancelled (confirmation did not match; record left in place)"
+        raise UninstallError("Arvan Cloud DNS deletion was cancelled; the DNS record was left in place.")
+
+    latest_records = fetch_arvan_dns_records(token)
+    same_id = [record for record in latest_records if record.get("id") == record_id]
+    latest_matches = matching_arvan_a_records(latest_records, site_name)
+    if not same_id:
+        stages[label] = "completed (record was already absent before DELETE)"
+        LOG.warn("The selected DNS record disappeared before DELETE; no DELETE request was sent.")
+        return
+    if (
+        len(same_id) != 1
+        or len(latest_matches) != 1
+        or latest_matches[0].get("id") != record_id
+        or arvan_record_ip(latest_matches[0]) != selected_ip
+    ):
+        raise UninstallError("The DNS record changed after confirmation; no DELETE request was sent.")
+    if latest_matches[0].get("is_protected") is True or latest_matches[0].get("can_delete") is False:
+        raise UninstallError("The selected DNS record is now protected; no DELETE request was sent.")
+
+    delete_url = (
+        f"{ARVAN_API_BASE_URL}/domains/{quote(BASE_DOMAIN, safe='')}/dns-records/"
+        f"{quote(record_id, safe='')}"
+    )
+    try:
+        arvan_api_request("DELETE", delete_url, token)
+    except ArvanAPIError as exc:
+        if not exc.outcome_uncertain:
+            raise
+        LOG.warn("DELETE outcome is uncertain; checking the record by ID before deciding what happened.")
+        try:
+            still_present = arvan_record_id_is_present(token, record_id)
+        except UninstallError as verify_error:
+            raise UninstallError(
+                f"DELETE outcome is uncertain and verification failed ({verify_error}); no retry was sent."
+            ) from None
+        if still_present:
+            raise UninstallError(
+                "The DNS record is still present after an uncertain DELETE; no automatic retry was sent."
+            ) from None
+        stages[label] = "completed (record absent after uncertain DELETE; verified by GET)"
+        LOG.ok("The selected DNS record is absent; deletion was verified by GET.")
+        return
+
+    try:
+        still_present = arvan_record_id_is_present(token, record_id)
+    except UninstallError as exc:
+        raise UninstallError(
+            f"DELETE returned success, but the follow-up GET could not verify the result: {exc}"
+        ) from None
+    if still_present:
+        raise UninstallError("DELETE returned success, but the selected DNS record is still present.")
+    stages[label] = "completed (deleted and verified by GET)"
+    LOG.ok("The selected Arvan Cloud A record was deleted and verified by GET.")
 
 
 def connect_to_database(driver: Any) -> Any:
@@ -400,6 +678,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
     stage_names = (
         "Preflight",
         "Database connection",
+        "Arvan API token",
         "Confirmation",
         "Disable Apache VirtualHosts",
         "Apache configtest",
@@ -409,10 +688,12 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
         "Remove site directory",
         "Drop MySQL database",
         "Final Apache configuration check",
+        "Delete Arvan Cloud DNS record",
     )
     stages: dict[str, str] = {label: "not run" for label in stage_names}
     db_driver: Any = None
     db_connection: Any = None
+    arvan_token: Optional[str] = None
     show_targets(paths)
 
     try:
@@ -423,14 +704,19 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
         stages["Database connection"] = "in progress"
         db_connection = connect_to_database(db_driver)
         stages["Database connection"] = "passed"
+        stages["Arvan API token"] = "in progress"
+        arvan_token = get_arvan_api_token()
+        stages["Arvan API token"] = "passed"
+        LOG.ok(f"{ARVAN_TOKEN_ENV_VAR} is set; the token value is not logged.")
         show_plan(paths)
 
         if dry_run:
             stages["Confirmation"] = "skipped (--dry-run)"
             for label in stage_names:
-                if label not in ("Preflight", "Confirmation"):
+                if label not in ("Preflight", "Database connection", "Arvan API token", "Confirmation", "Delete Arvan Cloud DNS record"):
                     stages[label] = "not run (--dry-run)"
             LOG.warn("Dry run enabled; no system changes will be made.")
+            delete_arvan_dns_record(name, arvan_token, stages, dry_run=True)
             final_report(paths, stages, db_connection=db_connection, db_driver=db_driver)
             return 0
 
@@ -489,6 +775,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
             raise UninstallError("Final Apache configuration check failed.")
         stages["Final Apache configuration check"] = "passed"
         LOG.ok("Final Apache configuration check passed.")
+        delete_arvan_dns_record(name, arvan_token, stages, dry_run=False)
         final_report(paths, stages, db_connection=db_connection, db_driver=db_driver)
         return 0
     except UninstallError as exc:
