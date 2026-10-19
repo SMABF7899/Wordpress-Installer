@@ -2685,7 +2685,8 @@ def check_arvan_cloud_response(site_name: str) -> HttpHeadResult:
             server = head.headers.get("server", "")
             if "arvancloud" in server.lower():
                 if 200 <= head.status < 400:
-                    log_success(f"Arvan Cloud: {url} answered {head.status} {head.reason} (Server: {server}).")
+                    answer = f"{head.status} {head.reason}".strip()
+                    log_success(f"Arvan Cloud: {url} answered {answer} (Server: {server}).")
                     return head
                 last = f"Arvan answered HTTP {head.status} {head.reason}".rstrip()
                 last += (": it can not get a good answer from the origin (check origin port 443 and the SSL mode)"
