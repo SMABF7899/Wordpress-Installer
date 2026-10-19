@@ -257,6 +257,6 @@ Common issues:
 
 ## License
 
-This repository does not currently include a license file. Add a `LICENSE` file to specify the terms for using and redistributing the project.
+This project is licensed under the terms described in [LICENSE](LICENSE).
 
 You can see Persian document in this [link](https://smabf7899.github.io/Wordpress-Installer/README.fa.html)
