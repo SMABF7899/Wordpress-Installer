@@ -16,7 +16,26 @@ Steps:
   6) Create wp-config.php
   7) Connect to the database server
   8) Check for the site database and create it (an existing one is never touched)
-  9) Print the final report
+  Linux only (run as root); skipped on Windows and with --skip-server-setup:
+  9) Create the DNS A record <site>.smabf.ir in Arvan Cloud (an exact existing record is reused)
+  10) Create the Apache virtual host config
+  11) Enable the site, run configtest and reload Apache (only if the test passes)
+  12) Check DNS, ping and HTTP access
+  13) Obtain the SSL certificate with Certbot (Production)
+  14) Verify the SSL config (port 443 virtual host) and the certificate
+  15) Check HTTPS on the origin and the HTTP to HTTPS redirect
+  16) Enable the Arvan Cloud proxy (only after a valid Production certificate)
+  17) Check the final answer (Server: ArvanCloud)
+  Last) Print the final report
+
+Database user creation, privilege changes and the final WordPress installation
+are intentionally NOT part of this script.
+
+Steps 9-17 need the environment variables ARVAN_API_TOKEN (Arvan API key) and
+CERTBOT_EMAIL (contact email for Let's Encrypt), root privileges, and the commands
+a2ensite, apache2ctl, certbot, curl and openssl (dig and ping are optional). All of it
+is checked before anything is created. Nothing created by steps 9-17 is rolled back
+or deleted when a step fails; the final report lists what was left in place.
 
 Database user creation, privilege changes, the final WordPress installation,
 Apache configuration and SSL are intentionally NOT part of this script.
@@ -40,8 +59,10 @@ Console output:
       FORCE_COLOR=1  always use colors (e.g. when piping into `less -R`)
 
 Usage:
-  Linux  :  sudo python3 wp_installer.py
-  Windows:  py -3 wp_installer.py
+  Linux  :  sudo ARVAN_API_TOKEN="$ARVAN_API_TOKEN" CERTBOT_EMAIL="$CERTBOT_EMAIL" python3 wp_installer.py
+            (sudo drops environment variables, so pass them explicitly as shown)
+  Linux, WordPress and database only:  sudo python3 wp_installer.py --skip-server-setup
+  Windows:  py -3 wp_installer.py      (steps 9-17 are skipped)
 
 Minimum Python version: 3.8
 """
@@ -2728,6 +2749,16 @@ def log_server_resources(ctx: InstallContext) -> None:
     if ctx.cloud_result is not None:
         log_info("Arvan Cloud proxy: " + ("enabled by this run" if ctx.cloud_result.enabled_now else "was already enabled"))
 
+def server_steps_planned(skip_server_setup: bool) -> bool:
+    """Steps 9-17 (DNS, Apache, SSL, Arvan Cloud) run only on Linux and unless --skip-server-setup was given."""
+    if skip_server_setup:
+        log_info("The DNS / Apache / SSL steps are skipped (--skip-server-setup).")
+        return False
+    if not is_linux():
+        log_warning("The DNS / Apache / SSL steps are supported on Linux only; they are skipped on this system.")
+        return False
+    return True
+
 # ======================================================================
 # Cleanup
 # ======================================================================
@@ -2872,14 +2903,23 @@ def run_installer(
     name_arg: Optional[str] = None,
     base_dir_arg: Optional[str] = None,
     verbose: bool = False,
+    skip_server_setup: bool = False,
 ) -> int:
     _console.verbose = verbose
     reporter = StepReporter()
     ctx = InstallContext()
+    arvan_token: Optional[str] = None
     exit_code = EXIT_OK
     try:
         with step(reporter, 1):
             ctx.site_name = obtain_site_name(name_arg)
+
+        ctx.server_steps_enabled = server_steps_planned(skip_server_setup)
+        if ctx.server_steps_enabled:
+            # Everything steps 9-17 need is checked now, before any file, database or DNS record is created.
+            log_step("Checking the requirements of the DNS / Apache / SSL steps...")
+            arvan_token = preflight_server_setup(ctx.site_name)
+            log_success("The requirements of the DNS / Apache / SSL steps are met.")
 
         with step(reporter, 2):
             ctx.base_dir = resolve_base_dir(base_dir_arg)
@@ -2922,6 +2962,46 @@ def run_installer(
         with step(reporter, 8):
             check_and_create_database(ctx, db)
 
+        if ctx.server_steps_enabled:
+            ensure_previous_steps_succeeded(reporter, 9)  # DNS, Apache and SSL only after steps 1-8 succeeded
+            if arvan_token is None or ctx.target_dir is None:  # cannot happen: the preflight and steps 1-8 succeeded
+                raise InstallerError("Internal error: the DNS / Apache / SSL steps are missing their prerequisites.")
+            ctx.server_phase_started = True  # from here on nothing is rolled back
+
+            with step(reporter, 9):
+                dns_result = ensure_dns_a_record(arvan_token, ctx.site_name)
+                ctx.dns_record = dns_result
+
+            with step(reporter, 10):
+                apache_result = create_apache_vhost_config(ctx.site_name, ctx.target_dir)
+                ctx.apache_conf = apache_result
+
+            with step(reporter, 11):
+                ctx.apache_enabled_now = activate_apache_site(apache_result.conf_path)
+
+            with step(reporter, 12):
+                # With the Arvan cloud proxy still off, DNS must point at this server itself.
+                reach = check_site_reachability(ctx.site_name, expect_origin=not dns_result.record.get("cloud"))
+                ping_text = {True: "ok", False: "failed (only a warning)", None: "skipped"}[reach.ping_ok]
+                log_info(f"DNS: {', '.join(reach.dns_ips)}; ping: {ping_text}; HTTP status: {reach.http_status}")
+
+            with step(reporter, 13):
+                ctx.ssl_result = obtain_ssl_certificate(ctx.site_name)
+
+            with step(reporter, 14):
+                verify_ssl_setup(ctx.site_name, ctx.target_dir)
+
+            with step(reporter, 15):
+                check_https_setup(ctx.site_name, via_origin=True)
+
+            ensure_previous_steps_succeeded(reporter, 16)  # the Arvan cloud proxy only after everything before it
+
+            with step(reporter, 16):
+                ctx.cloud_result = enable_arvan_cloud(arvan_token, ctx.site_name, ctx.target_dir)
+
+            with step(reporter, 17):
+                check_arvan_cloud_response(ctx.site_name)
+
     except InstallerError as exc:
         log_error(f"Reason: {exc}")
         log_debug("Technical details:\n" + traceback.format_exc())
@@ -2940,8 +3020,9 @@ def run_installer(
         cleanup_temp_dir(ctx.temp_dir)
 
     if exit_code != EXIT_OK:
-        rollback(ctx)
-        if ctx.db_created_name is not None:  # only possible if the run was interrupted right after CREATE
+        if not ctx.server_phase_started:  # no rollback once the DNS / Apache / SSL steps have begun
+            rollback(ctx)
+        if ctx.db_created_name is not None:  # the database is never dropped automatically
             log_warning(
                 f"Database {ctx.db_created_name} was created by this run and was left in place "
                 f"(databases are never dropped automatically)."
@@ -2978,6 +3059,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = _ArgumentParser(
         prog="wp_installer.py",
         description="Download and prepare Persian WordPress (Windows / Linux).",
+        epilog=(
+            "Steps 9-17 (Linux, root): DNS record, Apache, SSL certificate and Arvan Cloud. They need the "
+            "environment variables ARVAN_API_TOKEN and CERTBOT_EMAIL; sudo drops them, so run: "
+            "sudo ARVAN_API_TOKEN=... CERTBOT_EMAIL=... python3 wp_installer.py"
+        ),
     )
     parser.add_argument(
         "--name",
@@ -2990,6 +3076,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             f"On Windows you are prompted at run time (or set the {BASE_DIR_ENV_VAR} environment variable)."
         ),
     )
+    parser.add_argument(
+        "--skip-server-setup",
+        action="store_true",
+        help="Only install WordPress and create the database; skip the DNS, Apache and SSL steps (9-17).",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Show troubleshooting details (traceback)")
     return parser.parse_args(argv)
 
@@ -2997,7 +3088,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     _configure_console_encoding()
     args = parse_args(argv)
-    return run_installer(args.name, args.base_dir, args.verbose)
+    return run_installer(args.name, args.base_dir, args.verbose, args.skip_server_setup)
 
 
 if __name__ == "__main__":
