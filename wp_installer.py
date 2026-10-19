@@ -103,7 +103,7 @@ WP_DOWNLOAD_URL = "https://fa.wordpress.org/latest-fa_IR.zip"
 WP_SALT_API_URL = "https://api.wordpress.org/secret-key/1.1/salt/"
 
 # Suffix of the site folder: input "test"  ->  folder "test.ir"
-SITE_FOLDER_SUFFIX = "smabf.ir"
+SITE_FOLDER_SUFFIX = ".smabf.ir"
 
 # Base install directory
 LINUX_BASE_DIR = Path("/var/www/html")
