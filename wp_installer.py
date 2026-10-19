@@ -239,6 +239,15 @@ STEP_TITLES: Dict[int, str] = {
     6: "Create wp-config.php",
     7: "Connect to the database server",
     8: "Check and create the database",
+    9: "Create the DNS A record (Arvan Cloud)",
+    10: "Create the Apache virtual host config",
+    11: "Enable the site, test and reload Apache",
+    12: "Check DNS, ping and HTTP access",
+    13: "Obtain the SSL certificate (Certbot)",
+    14: "Verify the SSL config and certificate",
+    15: "Check HTTPS and the HTTP to HTTPS redirect",
+    16: "Enable the Arvan Cloud proxy",
+    17: "Check the final response through Arvan Cloud",
 }
 
 # Console messages of every step: (when it starts, when it succeeded, when it failed).
@@ -283,6 +292,51 @@ STEP_MESSAGES: Dict[int, Tuple[str, str, str]] = {
         "Checking database...",
         "Database created successfully.",
         "Failed to check or create the database.",
+    ),
+    9: (
+        "Creating the DNS A record in Arvan Cloud...",
+        "DNS A record is ready.",
+        "Failed to create the DNS A record.",
+    ),
+    10: (
+        "Creating the Apache virtual host config...",
+        "Apache virtual host config is ready.",
+        "Failed to create the Apache virtual host config.",
+    ),
+    11: (
+        "Enabling the site and reloading Apache...",
+        "Apache site enabled and reloaded.",
+        "Failed to enable the site or reload Apache.",
+    ),
+    12: (
+        "Checking DNS, ping and HTTP access...",
+        "DNS and HTTP checks passed.",
+        "DNS or HTTP check failed.",
+    ),
+    13: (
+        "Requesting the SSL certificate with Certbot...",
+        "SSL certificate obtained.",
+        "Failed to obtain the SSL certificate.",
+    ),
+    14: (
+        "Verifying the SSL configuration and certificate...",
+        "SSL configuration and certificate are valid.",
+        "SSL verification failed.",
+    ),
+    15: (
+        "Checking HTTPS and the HTTP to HTTPS redirect...",
+        "HTTPS works and HTTP redirects to it.",
+        "HTTPS or redirect check failed.",
+    ),
+    16: (
+        "Enabling the Arvan Cloud proxy...",
+        "Arvan Cloud proxy enabled.",
+        "Failed to enable the Arvan Cloud proxy.",
+    ),
+    17: (
+        "Checking the final response through Arvan Cloud...",
+        "Site is served through Arvan Cloud.",
+        "Final Arvan Cloud check failed.",
     ),
 }
 
@@ -564,6 +618,13 @@ class InstallContext:
     extracted_dirs: int = 0
     db_connection: Optional[Any] = field(default=None, repr=False)  # closed in run_installer's finally
     db_created_name: Optional[str] = None  # set only when THIS run created the database
+    server_steps_enabled: bool = False  # True when the DNS / Apache / SSL steps (9-17) are part of this run
+    server_phase_started: bool = False  # True once step 9 began: nothing is rolled back after that
+    dns_record: Optional[DnsRecordResult] = None
+    apache_conf: Optional[ApacheConfigResult] = None
+    apache_enabled_now: Optional[bool] = None
+    ssl_result: Optional[CertbotResult] = None
+    cloud_result: Optional[ArvanCloudResult] = None
 
 
 @dataclass(frozen=True)
@@ -2620,6 +2681,54 @@ def check_arvan_cloud_response(site_name: str) -> HttpHeadResult:
     )
 
 # ======================================================================
+# DNS / Apache / SSL phase: requirements check and resource listing
+# ======================================================================
+def preflight_server_setup(site_name: str) -> str:
+    """
+    Check everything steps 9-17 need BEFORE any file, database or DNS record is created: Linux, root
+    and Apache, the required commands, the Arvan API key (proven by a read-only request), the Certbot
+    email, and that the DNS name is free or already has exactly the expected A record.
+    Returns the Arvan API token.
+    """
+    check_apache_prerequisites()
+    required = ("a2ensite", "apache2ctl", "certbot", "curl", "openssl")
+    missing = [name for name in required if shutil.which(name) is None]
+    if missing:
+        raise CommandError(
+            "Required command(s) not found: " + ", ".join(missing) + ". Install them first, e.g.: "
+            "sudo apt install apache2 certbot python3-certbot-apache curl openssl"
+        )
+    if shutil.which("dig") is None:
+        log_warning("dig is not installed: the DNS check will use this server's resolver (sudo apt install dnsutils).")
+    if shutil.which("ping") is None:
+        log_warning("ping is not installed: the ping check will be skipped.")
+    token = get_arvan_token()
+    get_certbot_email()  # only validates the CERTBOT_EMAIL variable
+    fqdn = build_site_fqdn(site_name)
+    existing = check_dns_state(token, site_name)  # reads the whole zone; raises on a conflicting record
+    if existing is None:
+        log_info(f"The DNS name {fqdn} is free.")
+    else:
+        log_warning(f"The exact A record for {fqdn} already exists in Arvan (id {existing.get('id', '?')}); it will be reused.")
+    return token
+
+
+def log_server_resources(ctx: InstallContext) -> None:
+    """List what the DNS / Apache / SSL steps created or reused so far. None of it is ever rolled back."""
+    fqdn = build_site_fqdn(ctx.site_name)
+    if ctx.dns_record is not None:
+        state = "created" if ctx.dns_record.created else "already existed and was reused"
+        log_info(f"DNS A record {fqdn} -> {SERVER_IP}: {state} (id {ctx.dns_record.record.get('id', '?')})")
+    if ctx.apache_conf is not None:
+        state = "created" if ctx.apache_conf.created else "already existed and was reused"
+        enabled = {True: ", enabled by this run", False: ", was already enabled", None: ""}[ctx.apache_enabled_now]
+        log_info(f"Apache config {ctx.apache_conf.conf_path}: {state}{enabled}")
+    if ctx.ssl_result is not None:
+        log_info(f"SSL certificate files: {ctx.ssl_result.live_dir}")
+    if ctx.cloud_result is not None:
+        log_info("Arvan Cloud proxy: " + ("enabled by this run" if ctx.cloud_result.enabled_now else "was already enabled"))
+
+# ======================================================================
 # Cleanup
 # ======================================================================
 def cleanup_temp_dir(temp_dir: Optional[Path]) -> None:
@@ -2709,8 +2818,11 @@ def ensure_previous_steps_succeeded(reporter: StepReporter, number: int) -> None
 
 
 def print_report(reporter: StepReporter, ctx: InstallContext, exit_code: int) -> None:
-    log_step("Step 9: Final report")
+    last_step = max(STEP_TITLES) if ctx.server_steps_enabled else 8  # steps 9-17 only when they were part of this run
+    log_step(f"Step {last_step + 1}: Final report")
     for number, title in STEP_TITLES.items():
+        if number > last_step:
+            break
         status = reporter.status(number)
         if status == "ok":
             log_success(f"Step {number}: {title}")
@@ -2731,12 +2843,26 @@ def print_report(reporter: StepReporter, ctx: InstallContext, exit_code: int) ->
         log_info("wp-config.php: created")
         log_info(f"Database: {ctx.db_created_name} created on {db.host}:{db.port}")
         log_warning("The database user and password are TEMPORARY TEST values; change them before real use.")
-        log_info(
-            "Note: database user creation, privilege changes, the final WordPress installation, "
-            "Apache configuration and SSL are not performed by this script."
-        )
+        if ctx.server_phase_started:
+            log_info(f"Site address: https://{build_site_fqdn(ctx.site_name)}")
+            log_server_resources(ctx)
+            log_info(
+                "Note: database user creation, privilege changes and the final WordPress installation "
+                "are not performed by this script."
+            )
+        else:
+            log_info(
+                "Note: database user creation, privilege changes, the final WordPress installation, "
+                "Apache configuration and SSL are not performed by this script."
+            )
     else:
         log_error(f"Result: FAILED (exit code {exit_code})")
+        if ctx.server_phase_started:
+            log_server_resources(ctx)
+            log_warning(
+                "The WordPress files, the database and everything created by the DNS / Apache / SSL steps "
+                "were kept (no rollback after step 8). Remove them manually if they are not needed."
+            )
 
 
 # ======================================================================
