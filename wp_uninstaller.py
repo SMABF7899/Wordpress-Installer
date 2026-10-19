@@ -12,7 +12,7 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 BASE_DOMAIN = "smabf.ir"
@@ -24,7 +24,17 @@ LE_ARCHIVE = Path("/etc/letsencrypt/archive")
 LE_RENEWAL = Path("/etc/letsencrypt/renewal")
 
 NAME_PATTERN = re.compile(r"\A[a-z0-9](?:[a-z0-9-]{0,59}[a-z0-9])?\Z")
-REQUIRED_TOOLS = ("a2dissite", "apache2ctl", "systemctl", "certbot", "mysql", "rm")
+DB_NAME_PATTERN = re.compile(r"\A[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?\Z")
+REQUIRED_TOOLS = ("a2dissite", "apache2ctl", "systemctl", "certbot", "rm")
+
+# These database settings match wp_installer.py. Never print DB_PASSWORD.
+DB_USER = "root"
+DB_PASSWORD = "password"
+DB_HOST = "localhost"
+DB_PORT = 3306
+DB_CONNECT_TIMEOUT_SECONDS = 10
+DB_OPERATION_TIMEOUT_SECONDS = 30
+DB_DRIVER_PIP_NAME = "PyMySQL"
 
 
 class Log:
@@ -173,7 +183,18 @@ def check_sudo_access() -> None:
     LOG.ok("Sudo access verified.")
 
 
-def check_environment() -> None:
+def load_db_driver() -> Any:
+    try:
+        import pymysql
+    except ImportError as exc:
+        raise UninstallError(
+            f"The database driver {DB_DRIVER_PIP_NAME} is required. "
+            f"Install it with: {sys.executable} -m pip install {DB_DRIVER_PIP_NAME}"
+        ) from exc
+    return pymysql
+
+
+def check_environment() -> Any:
     if platform.system() != "Linux":
         raise UninstallError("This script can only run on Linux.")
     LOG.ok("Linux platform verified.")
@@ -181,7 +202,10 @@ def check_environment() -> None:
     if missing:
         raise UninstallError("Required tools are missing: " + ", ".join(missing))
     LOG.ok("Required tools are available: " + ", ".join(REQUIRED_TOOLS))
+    driver = load_db_driver()
+    LOG.ok(f"Database driver {DB_DRIVER_PIP_NAME} is available.")
     check_sudo_access()
+    return driver
 
 
 def show_targets(paths: dict[str, object]) -> None:
@@ -200,23 +224,49 @@ def show_plan(paths: dict[str, object]) -> None:
     LOG.info(f"Drop only the MySQL database {paths['database']}.")
 
 
-def mysql_query(database: str, query: str) -> subprocess.CompletedProcess[str]:
-    return run_command(
-        ["mysql", "--batch", "--skip-column-names", "--execute", query],
-        privileged=True,
-        timeout=60,
-    )
+def connect_to_database(driver: Any) -> Any:
+    try:
+        connection = driver.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=DB_OPERATION_TIMEOUT_SECONDS,
+            write_timeout=DB_OPERATION_TIMEOUT_SECONDS,
+            autocommit=True,
+        )
+    except driver.err.MySQLError as exc:
+        code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else "unknown"
+        if code == 1045:
+            reason = f"Authentication failed for database user '{DB_USER}'. Check DB_USER and DB_PASSWORD in the settings section."
+        else:
+            reason = f"MySQL returned error {code}. Check the database server and DB_HOST / DB_PORT settings."
+        raise UninstallError(f"Could not connect to MySQL at {DB_HOST}:{DB_PORT}. {reason}") from None
+    except OSError as exc:
+        raise UninstallError(f"Network error connecting to MySQL at {DB_HOST}:{DB_PORT}: {exc}") from exc
+    LOG.ok(f"Connected to MySQL at {DB_HOST}:{DB_PORT} as '{DB_USER}'.")
+    return connection
 
 
-def database_exists(database: str) -> bool:
-    query = (
-        "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA "
-        f"WHERE SCHEMA_NAME = '{database}';"
-    )
-    result = mysql_query(database, query)
-    if result.returncode != 0:
-        raise UninstallError("Could not inspect the MySQL database state.")
-    return database in result.stdout.splitlines()
+def validate_database_name(database: str) -> str:
+    if not database.endswith("_wp") or len(database) > 64 or not DB_NAME_PATTERN.fullmatch(database):
+        raise UninstallError(f"Refusing an unexpected database name: {database!r}")
+    return database
+
+
+def database_exists(connection: Any, driver: Any, database: str) -> bool:
+    validate_database_name(database)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = %s",
+                (database,),
+            )
+            return cursor.fetchone() is not None
+    except driver.err.MySQLError as exc:
+        code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else "unknown"
+        raise UninstallError(f"Could not inspect MySQL database state (error {code}).") from None
 
 
 def site_state(path: Path) -> str:
@@ -248,7 +298,8 @@ def final_report(
     paths: dict[str, object],
     stages: dict[str, str],
     *,
-    mysql_available: bool,
+    db_connection: Any,
+    db_driver: Any,
 ) -> None:
     LOG.step("Final status report:")
     for label, state in stages.items():
@@ -260,14 +311,14 @@ def final_report(
         LOG.info(f"Apache file {conf}: {'present' if lexists(conf) else 'absent'}")
     LOG.info(f"SSL certificate {paths['domain']}: {certificate_state(paths['cert_paths'])}")  # type: ignore[arg-type]
     LOG.info(f"Site files {paths['site_dir']}: {site_state(paths['site_dir'])}")  # type: ignore[arg-type]
-    if mysql_available:
+    if db_connection is not None and db_driver is not None:
         try:
-            exists = database_exists(str(paths["database"]))
+            exists = database_exists(db_connection, db_driver, str(paths["database"]))
             LOG.info(f"Database {paths['database']}: {'present' if exists else 'absent'}")
         except UninstallError as exc:
             LOG.warn(f"Database {paths['database']}: unknown ({exc})")
     else:
-        LOG.warn(f"Database {paths['database']}: unknown (MySQL could not be checked)")
+        LOG.warn(f"Database {paths['database']}: unknown (no authenticated MySQL connection)")
 
 
 def checked_action(label: str, argv: list[str], stages: dict[str, str], *, input_text: Optional[str] = None) -> None:
@@ -324,19 +375,22 @@ def remove_site_directory(path: Path, stages: dict[str, str]) -> None:
     LOG.ok(f"Removed site directory: {path}")
 
 
-def remove_database(database: str, stages: dict[str, str]) -> None:
+def remove_database(database: str, stages: dict[str, str], connection: Any, driver: Any) -> None:
     label = "Drop MySQL database"
     LOG.step(label)
     stages[label] = "in progress"
-    if not database_exists(database):
+    if not database_exists(connection, driver, database):
         stages[label] = "skipped (already absent)"
         LOG.info(f"Database already absent: {database}")
         return
-    query = f"DROP DATABASE `{database}`;"
-    result = mysql_query(database, query)
-    if result.returncode != 0:
-        stages[label] = f"FAILED (exit code {result.returncode})"
-        raise UninstallError(f"Could not drop MySQL database: {database}")
+    validate_database_name(database)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f"DROP DATABASE `{database}`")
+    except driver.err.MySQLError as exc:
+        code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else "unknown"
+        stages[label] = f"FAILED (MySQL error {code})"
+        raise UninstallError(f"Could not drop MySQL database {database} (MySQL error {code}).") from None
     stages[label] = "completed"
     LOG.ok(f"Dropped MySQL database: {database}")
 
@@ -345,6 +399,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
     paths = resource_paths(name)
     stage_names = (
         "Preflight",
+        "Database connection",
         "Confirmation",
         "Disable Apache VirtualHosts",
         "Apache configtest",
@@ -356,14 +411,18 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
         "Final Apache configuration check",
     )
     stages: dict[str, str] = {label: "not run" for label in stage_names}
-    mysql_available = shutil.which("mysql") is not None
+    db_driver: Any = None
+    db_connection: Any = None
     show_targets(paths)
 
     try:
         LOG.step("Preflight checks")
         stages["Preflight"] = "in progress"
-        check_environment()
+        db_driver = check_environment()
         stages["Preflight"] = "passed"
+        stages["Database connection"] = "in progress"
+        db_connection = connect_to_database(db_driver)
+        stages["Database connection"] = "passed"
         show_plan(paths)
 
         if dry_run:
@@ -372,7 +431,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
                 if label not in ("Preflight", "Confirmation"):
                     stages[label] = "not run (--dry-run)"
             LOG.warn("Dry run enabled; no system changes will be made.")
-            final_report(paths, stages, mysql_available=mysql_available)
+            final_report(paths, stages, db_connection=db_connection, db_driver=db_driver)
             return 0
 
         expected = str(paths["domain"])
@@ -388,7 +447,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
                 if state == "not run":
                     stages[label] = "not run (cancelled; no changes made)"
             LOG.warn("Confirmation did not match. No resources were changed.")
-            final_report(paths, stages, mysql_available=mysql_available)
+            final_report(paths, stages, db_connection=db_connection, db_driver=db_driver)
             return 0
         stages["Confirmation"] = "passed"
 
@@ -420,7 +479,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
 
         remove_apache_configs(paths, stages)
         remove_site_directory(paths["site_dir"], stages)  # type: ignore[arg-type]
-        remove_database(str(paths["database"]), stages)
+        remove_database(str(paths["database"]), stages, db_connection, db_driver)
 
         LOG.step("Final Apache configuration check")
         stages["Final Apache configuration check"] = "in progress"
@@ -430,7 +489,7 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
             raise UninstallError("Final Apache configuration check failed.")
         stages["Final Apache configuration check"] = "passed"
         LOG.ok("Final Apache configuration check passed.")
-        final_report(paths, stages, mysql_available=mysql_available)
+        final_report(paths, stages, db_connection=db_connection, db_driver=db_driver)
         return 0
     except UninstallError as exc:
         LOG.error(str(exc))
@@ -442,13 +501,21 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
         for label, state in stages.items():
             if state == "not run":
                 stages[label] = "not run (stopped before this stage)"
-        final_report(paths, stages, mysql_available=mysql_available)
+        final_report(paths, stages, db_connection=db_connection, db_driver=db_driver)
         return 1
+    finally:
+        if db_connection is not None:
+            try:
+                db_connection.close()
+                LOG.info("MySQL connection closed.")
+            except Exception as exc:  # A close failure must not hide the operation result.
+                LOG.warn(f"Could not close the MySQL connection cleanly ({type(exc).__name__}).")
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Safely remove one WordPress site from an Ubuntu Apache/MySQL server."
+        description="Safely remove one WordPress site from an Ubuntu Apache/MySQL server.",
+        epilog=f"Database settings match wp_installer.py; PyMySQL is required (python3 -m pip install {DB_DRIVER_PIP_NAME}).",
     )
     parser.add_argument("--name", help="Site name, for example zz-first")
     parser.add_argument(
