@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>راهنمای نصب‌کننده وردپرس</title>
+  <style>
+    :root { color-scheme: light; --ink: #202631; --muted: #5b6573; --line: #d9e0e8; --soft: #f4f7fa; --accent: #145b9c; }
+    * { box-sizing: border-box; }
+    html { direction: rtl; scroll-behavior: smooth; }
+    body { margin: 0; padding: 32px 18px; background: #f2f5f8; color: var(--ink); font-family: "Vazir", Tahoma, sans-serif; direction: rtl; text-align: right; line-height: 1.9; }
+    main { max-width: 1080px; margin: 0 auto; padding: clamp(20px, 4vw, 48px); background: #fff; border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 12px 36px rgba(30, 50, 70, .08); }
+    h1, h2, h3 { color: #172c42; line-height: 1.5; text-align: right; }
+    h1 { margin: 0 0 24px; padding-bottom: 18px; border-bottom: 2px solid var(--line); font-size: clamp(1.8rem, 4vw, 2.35rem); }
+    h2 { margin: 42px 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 1.55rem; }
+    h3 { margin: 30px 0 12px; font-size: 1.2rem; }
+    p { margin: 14px 0; }
+    ul, ol { padding-right: 1.7rem; padding-left: 0; margin: 12px 0 20px; }
+    li { padding-right: 3px; margin: 7px 0; }
+    a { color: var(--accent); overflow-wrap: anywhere; }
+    code { display: inline-block; direction: ltr; unicode-bidi: isolate; text-align: left; padding: .05em .35em; border-radius: 5px; background: #eef2f6; color: #243e58; font: .92em ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre.code-block { direction: ltr; unicode-bidi: isolate; text-align: left; overflow: auto; margin: 18px 0; padding: 16px 18px; border: 1px solid var(--line); border-radius: 10px; background: #f7f9fb; line-height: 1.55; }
+    pre.code-block code { display: block; padding: 0; background: transparent; color: #203247; white-space: pre; font-size: .92rem; }
+    .table-wrap { overflow-x: auto; margin: 16px 0 24px; }
+    table { width: 100%; border-collapse: collapse; text-align: right; }
+    th, td { padding: 11px 13px; border: 1px solid var(--line); text-align: right; vertical-align: top; }
+    th { background: var(--soft); color: #18334f; font-weight: 700; }
+    tbody tr:nth-child(even) { background: #fbfcfd; }
+    pre.mermaid { direction: ltr; unicode-bidi: isolate; overflow-x: auto; margin: 20px 0; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: #fff; text-align: center; }
+    .mermaid svg { max-width: 100%; height: auto; font-family: "Vazir", Tahoma, sans-serif !important; }
+    .mermaid .nodeLabel, .mermaid .edgeLabel { direction: rtl; text-align: center; unicode-bidi: plaintext; font-family: "Vazir", Tahoma, sans-serif !important; }
+    .diagram-note { color: var(--muted); font-size: .9rem; }
+    hr { border: 0; border-top: 1px solid var(--line); }
+    @media (max-width: 640px) { body { padding: 12px 8px; } main { padding: 20px 16px; border-radius: 10px; } th, td { padding: 8px; } }
+    @media print { body { padding: 0; background: #fff; } main { max-width: none; padding: 0; border: 0; box-shadow: none; } h2, h3 { break-after: avoid; } pre, table { break-inside: avoid; } }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="diagram-note">متن فارسی راست‌چین است؛ نام فایل‌ها، کدها و فرمان‌ها برای خوانایی چپ‌به‌راست نمایش داده می‌شوند. برای رندر نمودارها، مرورگر باید بتواند کتابخانهٔ Mermaid را از CDN بارگیری کند.</p>
+    <h1>نصب‌کننده وردپرس</h1>
+<p>این مخزن شامل دو اسکریپت خط فرمان با پایتون است: یکی برای نصب وردپرس فارسی (<code dir="ltr">fa_IR</code>) و دیگری برای حذف سایت‌هایی که در بستر میزبانی <code dir="ltr">smabf.ir</code> ساخته شده‌اند.</p>
+<p>اسکریپت نصب می‌تواند وردپرس را دریافت کند، فایل‌ها و پیکربندی آن را آماده کند، پایگاه داده MySQL/MariaDB بسازد و در لینوکس رکورد DNS، میزبان مجازی Apache، گواهی Let&#x27;s Encrypt و پراکسی Arvan Cloud را پیکربندی کند. اسکریپت حذف، منابع متناظر سایت را پاک می‌کند.</p>
+<h2>مهم: پیش از استفاده، تنظیمات را بررسی کنید</h2>
+<p>هر دو اسکریپت در حال حاضر اعتبارنامه‌های موقت پایگاه داده دارند: <code dir="ltr">DB_USER = &quot;root&quot;</code> و <code dir="ltr">DB_PASSWORD = &quot;password&quot;</code>. اسکریپت نصب این اعتبارنامه‌ها را در فایل <code dir="ltr">wp-config.php</code> هر سایت می‌نویسد. <strong>پیش از استفاده روی سرور واقعی، این مقادیر را در هر دو اسکریپت تغییر دهید.</strong> حساب پیکربندی‌شده باید مجوزهای لازم برای پایگاه داده را داشته باشد؛ اسکریپت حذف نیز برای حذف پایگاه داده مقصد به مجوز نیاز دارد. این اسکریپت‌ها حساب کاربری پایگاه داده نمی‌سازند و مجوزی به آن اعطا نمی‌کنند.</p>
+<p>تنظیمات پیش‌فرض به دامنه <code dir="ltr">smabf.ir</code>، نشانی IP سرور مبدأ <code dir="ltr">109.122.250.181</code> و ریشه وب لینوکس <code dir="ltr">/var/www/html</code> وابسته است. اگر محیط شما متفاوت است، تنظیمات ابتدای هر دو اسکریپت را بررسی و دامنه، IP مبدأ، مسیرها و تنظیمات پایگاه داده را تغییر دهید.</p>
+<h2>فایل‌های مخزن</h2>
+<div class="table-wrap"><table><thead><tr><th>فایل</th><th>کاربرد</th></tr></thead><tbody><tr><td><code dir="ltr">wp_installer.py</code></td><td>دریافت و آماده‌سازی یک سایت جدید وردپرس فارسی؛ در لینوکس، در صورت نیاز DNS، Apache، SSL و Arvan Cloud را هم پیکربندی می‌کند.</td></tr><tr><td><code dir="ltr">wp_uninstaller.py</code></td><td>حذف پوشه سایت، پایگاه داده، پیکربندی Apache، گواهی و رکورد DNS متناظر Arvan Cloud از سرور لینوکس.</td></tr></tbody></table></div>
+<h2>روند کار اسکریپت‌ها</h2>
+<p>این دو اسکریپت مستقل از هم اجرا می‌شوند. اسکریپت نصب، سایت و منابع آن را می‌سازد؛ اسکریپت حذف بعداً با استفاده از همان نام سایت، منابع متناظر را پیدا و حذف می‌کند.</p>
+<h3><code dir="ltr">wp_installer.py</code></h3>
+<pre class="mermaid" dir="ltr">flowchart TD
+    I0([شروع: --name یا پرسش تعاملی]) --&gt; I1[اعتبارسنجی نام سایت و تعیین مسیر مقصد]
+    I1 --&gt; I2{لینوکس و راه‌اندازی کامل سرور؟}
+    I2 -- بله --&gt; I3[پیش‌بررسی root، فرمان‌ها، توکن Arvan، ایمیل و DNS]
+    I2 -- &quot;خیر: ویندوز یا --skip-server-setup&quot; --&gt; I4[رد کردن راه‌اندازی سرور]
+    I3 -- بررسی‌ها موفق --&gt; I5[ساخت پوشه جدید سایت]
+    I3 -- بررسی ناموفق --&gt; IX[توقف و گزارش نتیجه]
+    I4 --&gt; I5
+    I5 -- مسیر از قبل وجود دارد --&gt; IX
+    I5 -- پوشه ساخته شد --&gt; I6[دریافت آخرین فایل فشرده وردپرس فارسی]
+    I6 --&gt; I7[استخراج امن فایل‌ها و دریافت کلیدهای امنیتی وردپرس]
+    I7 --&gt; I8[نوشتن wp-config.php]
+    I8 --&gt; I9[اتصال به MySQL یا MariaDB]
+    I9 --&gt; I10{نام پایگاه داده از قبل وجود دارد؟}
+    I10 -- بله --&gt; IX
+    I10 -- خیر --&gt; I11[ساخت پایگاه داده از نام سایت به‌علاوه _wp]
+    I11 --&gt; I12{راه‌اندازی سرور فعال است؟}
+    I12 -- خیر --&gt; I13[چاپ گزارش؛ تکمیل نصب وردپرس در مرورگر]
+    I12 -- بله --&gt; I14[ساخت یا استفاده مجدد از رکورد A در Arvan؛ پراکسی خاموش]
+    I14 --&gt; I15[ساخت میزبان مجازی Apache، فعال‌سازی، بررسی پیکربندی و بارگذاری مجدد]
+    I15 --&gt; I16[بررسی DNS و HTTP؛ دریافت و اعتبارسنجی گواهی TLS تولیدی]
+    I16 --&gt; I17[بررسی HTTPS و تغییرمسیر؛ فعال‌کردن پراکسی Arvan به مبدأ روی درگاه 443]
+    I17 --&gt; I18[بررسی پاسخ از مسیر Arvan Cloud و چاپ گزارش]</pre>
+<p>اگر نصب پیش از شروع مرحله راه‌اندازی سرور ناموفق شود، اسکریپت تلاش می‌کند فایل‌ها و پوشه‌هایی را که همان اجرا ساخته است پاک کند. پایگاه داده را هیچ‌وقت حذف نمی‌کند. پس از شروع مرحله راه‌اندازی سرور، منابع ساخته‌شده باقی می‌مانند و گزارش نهایی برای پاک‌سازی دستی آن‌ها راهنمایی می‌دهد.</p>
+<h3><code dir="ltr">wp_uninstaller.py</code></h3>
+<pre class="mermaid" dir="ltr">flowchart TD
+    U0([شروع: --name یا پرسش تعاملی]) --&gt; U1[اعتبارسنجی نام سایت و تعیین دامنه، مسیرها و پایگاه داده]
+    U1 --&gt; U2[بررسی ابزارهای لینوکس؛ اتصال به پایگاه داده؛ اعتبارسنجی توکن Arvan]
+    U2 --&gt; U3[نمایش منابع مقصد و برنامه حذف]
+    U3 --&gt; U4{گزینه --dry-run فعال است؟}
+    U4 -- بله --&gt; U5[بررسی رکورد DNS متناظر؛ بدون تغییر؛ چاپ گزارش]
+    U4 -- خیر --&gt; U6[تأیید با واردکردن دامنه کامل سایت]
+    U6 -- دامنه مطابقت ندارد --&gt; U7[لغو پیش از تغییرات؛ چاپ گزارش]
+    U6 -- دامنه مطابقت دارد --&gt; U8[غیرفعال‌کردن میزبان‌های مجازی؛ بررسی و بارگذاری مجدد Apache]
+    U8 --&gt; U9[حذف گواهی Certbot و فایل‌های پیکربندی Apache متناظر]
+    U9 --&gt; U10[حذف پوشه سایت و پایگاه داده]
+    U10 --&gt; U11[بررسی نهایی پیکربندی Apache]
+    U11 --&gt; U12{رکورد A دقیق Arvan وجود دارد؟}
+    U12 -- خیر --&gt; U14[بدون تغییر DNS، چاپ گزارش نهایی]
+    U12 -- بله --&gt; U13[تأیید DELETE دامنه؛ بازبینی دوباره، حذف و تأیید رکورد DNS]
+    U13 --&gt; U14</pre>
+<p>تأیید حذف DNS در اسکریپت حذف، پس از حذف منابع محلی سایت انجام می‌شود. اگر این تأیید را ندهید، رکورد DNS باقی می‌ماند، درحالی‌که ممکن است فایل‌های سایت، پایگاه داده، گواهی و پیکربندی‌های Apache قبلاً حذف شده باشند. خطا در هر مرحله گزارش می‌شود و کارهای حذف‌شده به‌صورت خودکار بازگردانده نمی‌شوند.</p>
+<h2>اسکریپت نصب چه کارهایی انجام می‌دهد؟</h2>
+<p>برای نام سایتی مانند <code dir="ltr">example</code>، اسکریپت نصب:</p>
+<ol><li>نام را اعتبارسنجی می‌کند و دامنه <code dir="ltr">example.smabf.ir</code> را می‌سازد.</li><li>پوشه مقصد جدیدی می‌سازد. اگر پوشه از قبل وجود داشته باشد، بدون تغییر آن متوقف می‌شود.</li><li>آخرین فایل فشرده وردپرس فارسی را از <code dir="ltr">https://fa.wordpress.org/latest-fa_IR.zip</code> دریافت و به‌شکل امن استخراج می‌کند.</li><li>کلیدها و saltهای امنیتی وردپرس را از API وردپرس دریافت می‌کند.</li><li>فایل <code dir="ltr">wp-config.php</code> را با تنظیمات پایگاه داده‌ای که در اسکریپت ثبت شده می‌نویسد.</li><li>به MySQL/MariaDB وصل می‌شود و پایگاه داده <code dir="ltr">example_wp</code> را می‌سازد. اگر این پایگاه داده از قبل وجود داشته باشد، اجرا متوقف می‌شود و آن را دست‌نخورده باقی می‌گذارد.</li><li>در لینوکس و در صورت استفاده‌نکردن از <code dir="ltr">--skip-server-setup</code>، رکورد DNS در Arvan Cloud، میزبان مجازی Apache، گواهی Let&#x27;s Encrypt، تغییرمسیر HTTPS و پراکسی Arvan Cloud را آماده می‌کند.</li></ol>
+<p>پس از پایان اسکریپت، هنوز باید راه‌اندازی وردپرس را در مرورگر تکمیل کنید. ساخت کاربر پایگاه داده و تنظیم مجوزهای آن نیز بر عهده مدیر سرور است.</p>
+<h3>راه‌اندازی سرور لینوکس</h3>
+<p>راه‌اندازی کامل سرور فقط در لینوکس انجام می‌شود و به دسترسی root نیاز دارد. این مرحله از ناحیه و تنظیمات سرور مبدأ که در اسکریپت ثبت شده‌اند استفاده می‌کند. پیش از ساخت فایل‌ها، پایگاه داده یا رکورد DNS، فرمان‌ها، اعتبارنامه‌ها و وضعیت DNS را بررسی می‌کند.</p>
+<p>مرحله راه‌اندازی سرور این کارها را به‌ترتیب انجام می‌دهد:</p>
+<ul><li>از رکورد A دقیق و مورد انتظار Arvan Cloud استفاده می‌کند یا رکوردی می‌سازد که به IP سرور مبدأ تنظیم‌شده اشاره کند.</li><li>میزبان مجازی HTTP در Apache را می‌سازد و فعال می‌کند؛ سپس پیکربندی Apache را بررسی می‌کند و فقط در صورت موفقیت، Apache را بارگذاری مجدد می‌کند.</li><li>دسترسی DNS و HTTP را بررسی می‌کند. بررسی <code dir="ltr">ping</code> اختیاری است.</li><li>با Certbot از نسخه تولیدی Let&#x27;s Encrypt گواهی می‌گیرد، آن را نصب می‌کند و تغییرمسیر HTTP به HTTPS را تنظیم می‌کند.</li><li>میزبان مجازی TLS در Apache و گواهی را اعتبارسنجی می‌کند و سپس HTTPS را روی سرور مبدأ بررسی می‌کند.</li><li>پراکسی Arvan Cloud را با HTTPS به سرور مبدأ روی درگاه 443 فعال می‌کند و پاسخ نهایی را بررسی می‌کند.</li></ul>
+<p>پس از شروع مرحله DNS/Apache/SSL، اگر مرحله‌ای بعدی شکست بخورد، اسکریپت منابع را به حالت قبل برنمی‌گرداند. گزارش نهایی را بررسی کنید و منابع باقی‌مانده را دستی پاک‌سازی کنید. پیش از این مرحله، اسکریپت در صورت امکان فایل‌ها و پوشه‌هایی را که همان اجرا ساخته است حذف می‌کند؛ اما هیچ‌وقت پایگاه داده را خودکار حذف نمی‌کند.</p>
+<h3>ویندوز و نصب فقط وردپرس</h3>
+<p>در ویندوز، اسکریپت مراحل وردپرس و پایگاه داده را اجرا می‌کند و مراحل DNS، Apache، گواهی و Arvan Cloud را رد می‌کند. مسیر پایه پیش‌فرض <code dir="ltr">C:\xampp\htdocs</code> است؛ در اجرای تعاملی می‌توانید مسیر دیگری انتخاب کنید. برای استفاده از سایت همچنان به MySQL/MariaDB و وب‌سروری مجهز به PHP نیاز دارید.</p>
+<p>در لینوکس، برای اجرای فقط مراحل وردپرس و پایگاه داده از <code dir="ltr">--skip-server-setup</code> استفاده کنید.</p>
+<h2>پیش‌نیازها</h2>
+<ul><li>پایتون نسخه 3.8 یا جدیدتر.</li><li>MySQL یا MariaDB که روی میزبان و درگاه تنظیم‌شده فعال باشد.</li><li>نصب PyMySQL برای همان مفسر پایتونی که هر یک از اسکریپت‌ها را اجرا می‌کند:</li></ul>
+<p>``<code dir="ltr">bash python3 -m pip install PyMySQL </code>``</p>
+<ul><li>برخی پیکربندی‌های احراز هویت MySQL 8 به <code dir="ltr">cryptography</code> هم نیاز دارند:</li></ul>
+<p>``<code dir="ltr">bash python3 -m pip install cryptography </code>``</p>
+<ul><li>برای اجرای وردپرس پس از نصب به وب‌سروری با PHP نیاز دارید. اسکریپت‌ها PHP، Apache یا MySQL/MariaDB را نصب نمی‌کنند.</li></ul>
+<p>برای راه‌اندازی کامل سرور لینوکس توسط اسکریپت نصب، این موارد را هم فراهم کنید:</p>
+<ul><li>Apache به‌همراه مسیر <code dir="ltr">/etc/apache2/sites-available</code> و فرمان‌های <code dir="ltr">a2ensite</code> و <code dir="ltr">apache2ctl</code>.</li><li>فرمان‌های <code dir="ltr">certbot</code>، <code dir="ltr">curl</code> و <code dir="ltr">openssl</code>.</li><li><code dir="ltr">dig</code> و <code dir="ltr">ping</code> اختیاری هستند؛ اگر نصب نباشند، بررسی آن‌ها رد می‌شود یا از DNS resolver سیستم استفاده می‌شود.</li><li>کلید API آروان در متغیر <code dir="ltr">ARVAN_API_TOKEN</code> با مجوز بررسی و به‌روزرسانی رکوردهای DNS برای اسکریپت نصب. اسکریپت حذف برای حذف رکورد A دقیق و متناظر نیز به مجوز نیاز دارد.</li><li>نشانی ایمیل معتبر برای Let&#x27;s Encrypt در <code dir="ltr">CERTBOT_EMAIL</code>.</li><li>دامنه و سرور مبدأ که از اینترنت در دسترس باشند. برای اعتبارسنجی Let&#x27;s Encrypt، دامنه باید درست resolve شود و ترافیک وب لازم به سرور مبدأ برسد.</li></ul>
+<p>اسکریپت حذف فقط در لینوکس اجرا می‌شود. به فرمان‌های <code dir="ltr">a2dissite</code>، <code dir="ltr">apache2ctl</code>، <code dir="ltr">systemctl</code>، <code dir="ltr">certbot</code> و <code dir="ltr">rm</code>، کتابخانه PyMySQL، دسترسی به سرور MySQL/MariaDB تنظیم‌شده و <code dir="ltr">ARVAN_API_TOKEN</code> نیاز دارد.</p>
+<h2>پیکربندی</h2>
+<p>تنظیمات به‌صورت ثابت در ابتدای هر فایل پایتون قرار دارند. مقادیر متناظر را در <strong>هر دو</strong> اسکریپت به‌روزرسانی کنید:</p>
+<ul><li>پایگاه داده: <code dir="ltr">DB_USER</code>، <code dir="ltr">DB_PASSWORD</code>، <code dir="ltr">DB_HOST</code> و <code dir="ltr">DB_PORT</code>.</li><li>دامنه و DNS: در اسکریپت نصب <code dir="ltr">DNS_ZONE</code>، <code dir="ltr">SITE_FOLDER_SUFFIX</code> و <code dir="ltr">SERVER_IP</code>؛ در اسکریپت حذف <code dir="ltr">BASE_DOMAIN</code>.</li><li>مسیرها: در اسکریپت نصب <code dir="ltr">LINUX_BASE_DIR</code> و مسیرهای Apache؛ در اسکریپت حذف <code dir="ltr">WEB_ROOT</code> و مسیرهای Apache و Let&#x27;s Encrypt.</li></ul>
+<p>اسکریپت نصب نام پایگاه داده را از <code dir="ltr">&lt;site-name&gt;_wp</code> می‌سازد، پیشوند جدول‌ها را <code dir="ltr">wp_</code> قرار می‌دهد و پایگاه داده را با <code dir="ltr">utf8mb4</code> و یک collation پشتیبانی‌شده می‌سازد. حساب پایگاه داده یا مجوزهای آن را ایجاد و تنظیم نمی‌کند.</p>
+<p>توکن API و ایمیل Let&#x27;s Encrypt از متغیرهای محیطی خوانده می‌شوند. توکن را در مخزن کد قرار ندهید و در لاگ‌ها ثبت نکنید. در لینوکس مطمئن شوید <code dir="ltr">sudo</code> متغیرهای لازم را به اسکریپت منتقل می‌کند. برای نمونه، پس از تعریف متغیرها در shell:</p>
+<pre class="code-block" dir="ltr"><code class="language-bash">export ARVAN_API_TOKEN=&#x27;your-arvan-api-token&#x27;
+export CERTBOT_EMAIL=&#x27;admin@example.com&#x27;
+sudo --preserve-env=ARVAN_API_TOKEN,CERTBOT_EMAIL python3 wp_installer.py --name example</code></pre>
+<p>ممکن است سیاست <code dir="ltr">sudo</code> شما نیازمند اجازه برای حفظ این متغیرها باشد. اسکریپت حذف فقط به توکن آروان نیاز دارد:</p>
+<pre class="code-block" dir="ltr"><code class="language-bash">sudo --preserve-env=ARVAN_API_TOKEN python3 wp_uninstaller.py --name example --dry-run</code></pre>
+<h2>نصب سایت</h2>
+<h3>لینوکس: وردپرس، پایگاه داده و راه‌اندازی سرور</h3>
+<p>PyMySQL را برای مفسر پایتونی‌ای نصب کنید که با <code dir="ltr">sudo</code> اجرا می‌شود، تنظیمات را پیکربندی کنید، توکن آروان و ایمیل تماس را در محیط تعریف کنید و سپس اجرا کنید:</p>
+<pre class="code-block" dir="ltr"><code class="language-bash">sudo --preserve-env=ARVAN_API_TOKEN,CERTBOT_EMAIL python3 wp_installer.py --name example</code></pre>
+<p>فایل‌ها به‌طور پیش‌فرض در <code dir="ltr">/var/www/html/example.smabf.ir</code> قرار می‌گیرند. اگر راه‌اندازی موفق باشد، <code dir="ltr">https://example.smabf.ir/wp-admin/install.php</code> را باز کنید و تنظیم سایت وردپرس را تکمیل کنید.</p>
+<h3>لینوکس: فقط وردپرس و پایگاه داده</h3>
+<pre class="code-block" dir="ltr"><code class="language-bash">sudo python3 wp_installer.py --name example --skip-server-setup</code></pre>
+<p>این حالت هم به اتصال فعال پایگاه داده و مجوز ساخت <code dir="ltr">example_wp</code> نیاز دارد. پیش از بازکردن صفحه راه‌اندازی وردپرس، وب‌سرور را جداگانه پیکربندی کنید.</p>
+<h3>ویندوز</h3>
+<pre class="code-block" dir="ltr"><code class="language-powershell">py -3 -m pip install PyMySQL
+py -3 wp_installer.py --name example</code></pre>
+<p>مسیر پیش‌فرض <code dir="ltr">C:\xampp\htdocs\example.smabf.ir</code> است. اگر XAMPP فعال باشد، صفحه نصب محلی معمولاً در <code dir="ltr">http://localhost/example.smabf.ir/wp-admin/install.php</code> قرار دارد.</p>
+<h3>گزینه‌های خط فرمان نصب‌کننده</h3>
+<p>برای مشاهده راهنمای فعلی، <code dir="ltr">python3 wp_installer.py --help</code> را اجرا کنید. در ویندوز از <code dir="ltr">py -3 wp_installer.py --help</code> استفاده کنید.</p>
+<div class="table-wrap"><table><thead><tr><th>گزینه</th><th>توضیح</th></tr></thead><tbody><tr><td><code dir="ltr">--name NAME</code></td><td>نام سایت بدون پسوند دامنه. اگر وارد نشود، اسکریپت آن را از شما می‌پرسد. نام به حروف کوچک تبدیل می‌شود، باید ۱ تا ۶۱ نویسه داشته باشد و فقط از حروف انگلیسی، رقم و خط تیره میانی تشکیل شود؛ <code dir="ltr">.smabf.ir</code> را وارد نکنید.</td></tr><tr><td><code dir="ltr">--base-dir PATH</code></td><td>مسیر پایه مطلق سایت. نسبت به متغیر محیطی <code dir="ltr">WP_INSTALLER_BASE_DIR</code> اولویت دارد.</td></tr><tr><td><code dir="ltr">--skip-server-setup</code></td><td>مراحل DNS، Apache، SSL و Arvan Cloud در لینوکس را رد می‌کند.</td></tr><tr><td><code dir="ltr">-v</code>، <code dir="ltr">--verbose</code></td><td>برای عیب‌یابی، جزئیات traceback را نمایش می‌دهد.</td></tr></tbody></table></div>
+<p>اگر <code dir="ltr">--base-dir</code> یا <code dir="ltr">WP_INSTALLER_BASE_DIR</code> تعیین نشده باشد، مسیر لینوکس <code dir="ltr">/var/www/html</code> است. در ویندوز مسیر <code dir="ltr">C:\xampp\htdocs</code> استفاده می‌شود و در ترمینال تعاملی ممکن است مسیر پایه از شما پرسیده شود.</p>
+<h2>حذف سایت</h2>
+<p>اسکریپت حذف مسیرها و پایگاه داده را از نام معتبر سایت به‌دست می‌آورد. ابتدا محیط را بررسی می‌کند، به MySQL/MariaDB وصل می‌شود، وضعیت توکن آروان را بررسی می‌کند و برنامه حذف را نمایش می‌دهد.</p>
+<p>ابتدا اجرای آزمایشی انجام دهید:</p>
+<pre class="code-block" dir="ltr"><code class="language-bash">sudo --preserve-env=ARVAN_API_TOKEN python3 wp_uninstaller.py --name example --dry-run</code></pre>
+<p>اجرای آزمایشی فرمانی برای تغییر منابع اجرا نمی‌کند و رکورد DNS را حذف نمی‌کند. بااین‌حال، برای بررسی منابع مقصد به ابزارهای لینوکس، اتصال پایگاه داده و توکن معتبر آروان نیاز دارد.</p>
+<p>برای حذف واقعی، <code dir="ltr">--dry-run</code> را بردارید:</p>
+<pre class="code-block" dir="ltr"><code class="language-bash">sudo --preserve-env=ARVAN_API_TOKEN python3 wp_uninstaller.py --name example</code></pre>
+<p>پیش از شروع، اسکریپت از شما می‌خواهد دامنه کامل <code dir="ltr">example.smabf.ir</code> را وارد کنید. سپس میزبان‌های مجازی سایت را در Apache غیرفعال می‌کند، پیکربندی را بررسی و Apache را بارگذاری مجدد می‌کند، گواهی Certbot متناظر را حذف می‌کند، فایل‌های پیکربندی Apache و پوشه سایت را پاک می‌کند و پایگاه داده <code dir="ltr">example_wp</code> را حذف می‌کند. حذف رکورد A دقیق و متناظر Arvan Cloud آخرین عملیات است.</p>
+<p>برای حذف DNS، تأیید دوم هم لازم است: عبارت <code dir="ltr">DELETE example.smabf.ir</code> را وارد کنید. این درخواست پس از حذف منابع محلی سایت نمایش داده می‌شود. اگر آن را تأیید نکنید، رکورد DNS باقی می‌ماند، درحالی‌که ممکن است فایل‌های سایت، پایگاه داده، گواهی و پیکربندی‌های Apache حذف شده باشند. اسکریپت گزارش نهایی هر مرحله و وضعیت منابع را چاپ می‌کند.</p>
+<h3>گزینه‌های خط فرمان حذف‌کننده</h3>
+<div class="table-wrap"><table><thead><tr><th>گزینه</th><th>توضیح</th></tr></thead><tbody><tr><td><code dir="ltr">--name NAME</code></td><td>نام سایت بدون <code dir="ltr">.smabf.ir</code>. اگر وارد نشود، اسکریپت آن را از شما می‌پرسد.</td></tr><tr><td><code dir="ltr">--dry-run</code></td><td>عملیات حذف را بررسی و گزارش می‌کند، بدون آنکه منابع سیستم را تغییر دهد.</td></tr></tbody></table></div>
+<h2>نکات ایمنی و عملیاتی</h2>
+<ul><li>اگر پوشه سایت یا پایگاه داده از قبل وجود داشته باشد، اسکریپت نصب متوقف می‌شود و محتوای موجود را دست‌نخورده می‌گذارد.</li><li>استخراج ZIP مسیرهای فایل را اعتبارسنجی می‌کند و برای اندازه بایگانی و تعداد ورودی‌ها محدودیت دارد.</li><li>اسکریپت نصب پایگاه داده را حذف نمی‌کند. اگر اجرا پس از ساخت پایگاه داده با خطا مواجه شود، پایگاه داده باقی می‌ماند.</li><li>پس از شروع مرحله راه‌اندازی سرور، اسکریپت نصب تغییرات DNS، Apache، گواهی یا Arvan Cloud را بازنمی‌گرداند.</li><li>اسکریپت حذف مخرب است: پس از تأییدهای لازم، فایل‌ها و پایگاه داده سایت مشتق‌شده از نام را حذف می‌کند و رکورد A دقیق Arvan Cloud را پاک می‌کند. مسیرهای نمایش‌داده‌شده را بررسی و پیش از اجرا نسخه پشتیبان تهیه کنید.</li><li>اسکریپت حذف پیش از پاک‌سازی مسیرها را بررسی می‌کند و از حذف هدف‌های نمادین، تغییرمسیر‌یافته، mountشده یا غیرمنتظره خودداری می‌کند. در صورت ابهام بین چند رکورد DNS نیز متوقف می‌شود.</li><li>هیچ‌کدام از اسکریپت‌ها کاربر جداگانه وردپرس را در پایگاه داده نمی‌سازند و مجوزی اعمال نمی‌کنند. با تنظیمات فعلی، سایت‌های ساخته‌شده با کاربر <code dir="ltr">root</code> به MySQL وصل می‌شوند؛ پیش از استفاده واقعی حسابی با دسترسی محدودتر پیکربندی کنید.</li></ul>
+<h2>خروجی و عیب‌یابی</h2>
+<p>هر دو اسکریپت پیام‌های وضعیت زمان‌دار و گزارش نهایی چاپ می‌کنند. رمز پایگاه داده یا توکن آروان در لاگ‌های عادی چاپ نمی‌شود. برای دیدن جزئیات traceback در اسکریپت نصب از <code dir="ltr">-v</code> استفاده کنید.</p>
+<p>خطاهای رایج:</p>
+<ul><li><strong>خطای ورود یا مجوز MySQL:</strong> مقادیر <code dir="ltr">DB_USER</code>، <code dir="ltr">DB_PASSWORD</code>، <code dir="ltr">DB_HOST</code> و <code dir="ltr">DB_PORT</code> را در هر دو اسکریپت بررسی کنید و مطمئن شوید حساب برای ساخت یا حذف پایگاه داده مقصد مجوز دارد.</li><li><strong>خطای import برای PyMySQL:</strong> PyMySQL را برای همان مفسر پایتونی نصب کنید که اسکریپت را اجرا می‌کند؛ مفسری که زیر <code dir="ltr">sudo</code> اجرا می‌شود نیز باید آن را داشته باشد.</li><li><strong>خطای Arvan API:</strong> مطمئن شوید <code dir="ltr">ARVAN_API_TOKEN</code> تعریف شده و به ناحیه DNS تنظیم‌شده دسترسی کافی دارد.</li><li><strong>خطای اعتبارسنجی گواهی:</strong> بررسی کنید DNS به سرور مبدأ اشاره کند، وب‌سرور روی درگاه‌های لازم در دسترس باشد و <code dir="ltr">CERTBOT_EMAIL</code> معتبر باشد.</li><li><strong>خطای راه‌اندازی Apache:</strong> نصب بودن فرمان‌های لازم، موفقیت <code dir="ltr">apache2ctl configtest</code> و اجرای اسکریپت با دسترسی root را بررسی کنید.</li></ul>
+<h2>مجوز</h2>
+<p>این مخزن در حال حاضر فایل مجوز ندارد. برای مشخص‌کردن شرایط استفاده و بازتوزیع پروژه، فایل <code dir="ltr">LICENSE</code> اضافه کنید.</p>
+  </main>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@12/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      securityLevel: "strict",
+      theme: "neutral",
+      fontFamily: "Vazir, Tahoma, sans-serif",
+      themeVariables: { fontFamily: "Vazir, Tahoma, sans-serif" },
+      flowchart: { htmlLabels: true, useMaxWidth: true }
+    });
+  </script>
+</body>
+</html>
