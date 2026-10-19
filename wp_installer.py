@@ -146,7 +146,7 @@ DNS_POST_MAX_ATTEMPTS = 2  # at most one repeat, and only after the DNS state wa
 DNS_RECHECK_DELAY_SECONDS = 3  # short pause before re-checking after an unclear POST
 ARVAN_UPSTREAM_PORT = 443  # origin port Arvan connects to once the cloud proxy is on
 ARVAN_UPDATE_MAX_ATTEMPTS = 2  # at most one repeat of a PUT, and only after the record was re-read
-ARVAN_CLOUD_WAIT_SECONDS = 300  # how long to wait until the site is served through Arvan Cloud
+ARVAN_CLOUD_WAIT_SECONDS = 600  # how long to wait until the site is served through Arvan Cloud
 ARVAN_CLOUD_POLL_INTERVAL_SECONDS = 10
 
 # ----------------------------------------------------------------------
