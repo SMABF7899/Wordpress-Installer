@@ -8,7 +8,7 @@ The installer can download WordPress, prepare its files and configuration, creat
 
 Both scripts currently contain temporary database credentials in their settings: `DB_USER = "root"` and `DB_PASSWORD = "password"`. The installer writes these credentials into each generated `wp-config.php`. **Change these values in both scripts before using them on a real server.** The configured account needs the database privileges required by your setup; the uninstaller also needs permission to drop the target database. These scripts do not create database users or grant privileges.
 
-The default setup is tied to `smabf.ir`, the origin IP `109.122.250.181`, and the `/var/www/html` web root on Linux. Review the settings near the top of both scripts and change the domain, origin IP, paths, and database settings if your environment differs.
+The default setup is tied to `smabf.ir`, the origin IP `SERVER_IP`, and the `/var/www/html` web root on Linux. Review the settings near the top of both scripts and change the domain, origin IP, paths, and database settings if your environment differs.
 
 ## Repository contents
 
