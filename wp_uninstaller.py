@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import platform
@@ -20,6 +21,7 @@ from urllib.request import Request, urlopen
 
 
 BASE_DOMAIN = "smabf.ir"
+SITE_FOLDER_SUFFIX = ".smabf.ir"
 WEB_ROOT = Path("/var/www/html")
 APACHE_AVAILABLE = Path("/etc/apache2/sites-available")
 APACHE_ENABLED = Path("/etc/apache2/sites-enabled")
@@ -33,7 +35,7 @@ REQUIRED_TOOLS = ("a2dissite", "apache2ctl", "systemctl", "certbot", "rm")
 
 # These database settings match wp_installer.py. Never print DB_PASSWORD.
 DB_USER = "root"
-DB_PASSWORD = "password"
+DB_PASSWORD = ""
 DB_HOST = "localhost"
 DB_PORT = 3306
 DB_CONNECT_TIMEOUT_SECONDS = 10
@@ -139,7 +141,7 @@ def validate_name(name: str) -> str:
 def resource_paths(name: str) -> dict[str, object]:
     domain = f"{name}.{BASE_DOMAIN}"
     database = f"{name}_wp"
-    site_dir = WEB_ROOT / domain
+    site_dir = WEB_ROOT / f"{name}{SITE_FOLDER_SUFFIX}"
     apache_files = [
         APACHE_AVAILABLE / f"{domain}.conf",
         APACHE_AVAILABLE / f"{domain}-le-ssl.conf",
@@ -517,7 +519,7 @@ def connect_to_database(driver: Any) -> Any:
     except driver.err.MySQLError as exc:
         code = exc.args[0] if exc.args and isinstance(exc.args[0], int) else "unknown"
         if code == 1045:
-            reason = f"Authentication failed for database user '{DB_USER}'. Check DB_USER and DB_PASSWORD in the settings section."
+            reason = f"Authentication failed for database user '{DB_USER}'. Check the values entered in the runtime prompts."
         else:
             reason = f"MySQL returned error {code}. Check the database server and DB_HOST / DB_PORT settings."
         raise UninstallError(f"Could not connect to MySQL at {DB_HOST}:{DB_PORT}. {reason}") from None
@@ -525,6 +527,41 @@ def connect_to_database(driver: Any) -> Any:
         raise UninstallError(f"Network error connecting to MySQL at {DB_HOST}:{DB_PORT}: {exc}") from exc
     LOG.ok(f"Connected to MySQL at {DB_HOST}:{DB_PORT} as '{DB_USER}'.")
     return connection
+
+
+def configure_runtime_settings() -> None:
+    global BASE_DOMAIN, SITE_FOLDER_SUFFIX, DB_USER, DB_PASSWORD
+
+    try:
+        base_domain = input(f"Base domain [{BASE_DOMAIN}]: ").strip()
+        site_folder_suffix = input(f"Site folder suffix [{SITE_FOLDER_SUFFIX}]: ").strip()
+        db_user = input(f"Database user [{DB_USER}]: ").strip()
+        db_password = getpass.getpass("Database password (input hidden): ")
+    except (EOFError, KeyboardInterrupt):
+        raise UninstallError("Runtime configuration input was cancelled or unavailable.") from None
+
+    if base_domain:
+        BASE_DOMAIN = base_domain.rstrip(".").lower()
+    if not re.fullmatch(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", BASE_DOMAIN):
+        raise UninstallError("Base domain must be a valid DNS domain name, such as smabf.ir.")
+
+    if site_folder_suffix:
+        SITE_FOLDER_SUFFIX = site_folder_suffix.lower()
+    if not SITE_FOLDER_SUFFIX.startswith(".") or not re.fullmatch(
+        r"\.(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+        SITE_FOLDER_SUFFIX,
+    ):
+        raise UninstallError("Site folder suffix must be a dot followed by a valid domain suffix, such as .smabf.ir.")
+
+    if db_user:
+        DB_USER = db_user
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,32}", DB_USER):
+        raise UninstallError("Database user must be 1-32 characters using letters, digits, '.', '_', '@', or '-'.")
+    if not db_password:
+        raise UninstallError("Database password cannot be empty.")
+    DB_PASSWORD = db_password
+    LOG.info(f"Runtime settings: base domain={BASE_DOMAIN}, folder suffix={SITE_FOLDER_SUFFIX}, database user={DB_USER}.")
+    LOG.info("Database password was received and will not be logged.")
 
 
 def validate_database_name(database: str) -> str:
@@ -802,7 +839,10 @@ def run_uninstall(name: str, *, dry_run: bool) -> int:
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Safely remove one WordPress site from an Ubuntu Apache/MySQL server.",
-        epilog=f"Database settings match wp_installer.py; PyMySQL is required (python3 -m pip install {DB_DRIVER_PIP_NAME}).",
+        epilog=(
+            f"This script prompts for the domain, folder suffix, database user, and hidden database password. "
+            f"PyMySQL is required (python3 -m pip install {DB_DRIVER_PIP_NAME})."
+        ),
     )
     parser.add_argument("--name", help="Site name, for example zz-first")
     parser.add_argument(
@@ -824,6 +864,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
     try:
         validate_name(name)
+    except UninstallError as exc:
+        LOG.error(str(exc))
+        return 2
+    try:
+        configure_runtime_settings()
     except UninstallError as exc:
         LOG.error(str(exc))
         return 2
